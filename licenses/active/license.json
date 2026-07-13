@@ -1,0 +1,19 @@
+{
+  "license_version": 1,
+  "product_name": "Fortune BJ Optimizer",
+  "license_id": "LIC-TRIAL-20260702-172848",
+  "license_type": "trial",
+  "customer_name": "BJ_Fortune",
+  "customer_id": "BJ_Fortune",
+  "issue_date": "2026-07-02",
+  "expiry_date": "2026-08-30",
+  "binding_mode": "unbound",
+  "machine_fingerprint": "",
+  "machine_label": "",
+  "features": {
+    "global_scheduling": true,
+    "excel_report": true
+  },
+  "note": "Trial license",
+  "signature": "pFflWUbZJny1Uo5xWLrrr0ODHsvudDMI0cXflJBtsHrrkuUHsZz95cqvL0KJzMA6eQdfSr+YLgD4LTdiMqTkAw=="
+}

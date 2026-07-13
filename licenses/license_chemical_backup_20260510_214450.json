@@ -1,0 +1,20 @@
+{
+  "license_version": 1,
+  "product_name": "Chemical Capacity Optimizer",
+  "license_id": "LIC-TRIAL-20260510-213941",
+  "license_type": "trial",
+  "customer_name": "BJ_Fortune",
+  "customer_id": "BJ_Fortune",
+  "issue_date": "2026-05-10",
+  "expiry_date": "2027-05-09",
+  "binding_mode": "unbound",
+  "machine_fingerprint": "",
+  "machine_label": "",
+  "features": {
+    "mode_a": true,
+    "mode_b": true,
+    "comparison_workbook": true
+  },
+  "note": "Trial license",
+  "signature": "pLEAisN3fHbg7e8YBbHEBbkT/zwhNHJkMapquuyWuVxjvn+XWDSPjsvSTE6Bmcd3o+O7TUCYrZZlRjgLV/yyAw=="
+}
