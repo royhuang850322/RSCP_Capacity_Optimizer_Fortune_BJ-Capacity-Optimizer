@@ -1,5 +1,13 @@
 # Fortune BJ Capacity Optimizer Changelog
 
+## v0.1.2 - 2026-07-24
+
+- Split ModeB optimized allocation load across reporting weeks/months in the order-operation detail, period capacity report, workgroup heatmap, optimization overview, and capacity recommendation sheets.
+- Add ModeB detail fields for allocation-period split rows and period-level original/optimized load hours, so detail totals reconcile with heatmap totals.
+- Keep ModeB OR-Tools optimization at period-level integer product allocation; the new split only changes report load attribution and does not add solver variables.
+- Update default input paths for current workbook-based demand, work center, optional operation, and calendar templates.
+- Update packaging to include `.csv`, `.xlsx`, and `.xls` input templates in the packaged application folder.
+
 ## v0.1.1 - 2026-07-13
 
 - Rename demand input file to `订单交期数量_产能分析输入模板.csv`.

@@ -49,10 +49,10 @@ DATA_DIR = DEPLOY_ROOT / "数据导入"
 REPORT_DIR = DEPLOY_ROOT / "报告"
 
 OPS_TEMPLATE_NAME = "生产订单工序_排产输入模板.csv"
-DEMAND_TEMPLATE_NAME = "订单交期数量_产能分析输入模板.csv"
-WC_TEMPLATE_NAME = "工作中心_排产输入模板.csv"
-OPTIONAL_OPS_TEMPLATE_NAME = "可选工序_排产输入模板.csv"
-CALENDAR_TEMPLATE_NAME = "工作日历_排产输入模板.csv"
+DEMAND_TEMPLATE_NAME = "订单交期数量_产能分析输入模板.xlsx"
+WC_TEMPLATE_NAME = "工作中心_排产输入模板.xlsx"
+OPTIONAL_OPS_TEMPLATE_NAME = "可选工序_排产输入模板.xlsx"
+CALENDAR_TEMPLATE_NAME = "工作日历_排产输入模板.xlsx"
 
 PLACEHOLDER_DUE_YEAR = 2049
 OUTSOURCE_DURATION_HOURS = 7 * 24
@@ -216,6 +216,20 @@ class ModeBAllocation:
     line_throughput_rate: float = 0.0
     residence_hours: float = 0.0
     capacity_load_units: float = 0.0
+
+
+@dataclass(frozen=True)
+class ModeBAllocationPeriodSegment:
+    allocation: ModeBAllocation
+    period: str
+    period_start: datetime
+    period_end: datetime
+    load_hours: float
+    original_load_hours: float
+    original_released_hours: float
+    extra_hours: float
+    unmaintained_load_hours: float
+    capacity_load_units: float
 
 
 @dataclass
@@ -1037,6 +1051,54 @@ def _schedule_tasks_infinite_capacity(
     return scheduled
 
 
+def _modeb_forward_analysis_start(tasks: list[OperationTask], config: FortuneBjConfig | None) -> datetime:
+    configured_start = _optimization_start_period(config)
+    if configured_start is not None:
+        return configured_start
+    return min(_optimization_period_start(task, config) for task in tasks)
+
+
+def _schedule_tasks_modeb_forward_projection(
+    tasks: list[OperationTask],
+    *,
+    config: FortuneBjConfig | None = None,
+) -> list[ScheduledOperation]:
+    tasks_by_order: dict[str, list[OperationTask]] = {}
+    for task in tasks:
+        tasks_by_order.setdefault(task.order_id, []).append(task)
+    analysis_start = _modeb_forward_analysis_start(tasks, config)
+    scheduled: list[ScheduledOperation] = []
+
+    def order_sort_key(key: str) -> tuple[int, datetime, datetime, str]:
+        order_tasks = tasks_by_order[key]
+        priority_rank = min(task.priority_rank for task in order_tasks)
+        priority_date = min(_priority_sort_date(task) for task in order_tasks)
+        due_date = min(task.due_date for task in order_tasks)
+        return priority_rank, priority_date, due_date, key
+
+    for order_id in sorted(tasks_by_order, key=order_sort_key):
+        cursor = analysis_start
+        order_tasks = sorted(tasks_by_order[order_id], key=lambda task: task.activity)
+        for task in order_tasks:
+            duration_hours = OUTSOURCE_DURATION_HOURS if task.is_outsource else max(float(task.duration_hours), 0.0)
+            start = cursor
+            end = start + timedelta(hours=duration_hours)
+            if task.is_outsource:
+                note = "ModeB优化开始周期前推基线；外协固定7天，不占用本地资源"
+            else:
+                note = "ModeB优化开始周期前推基线"
+            scheduled.append(ScheduledOperation(
+                task=task,
+                start=start,
+                end=end,
+                on_time=end <= task.due_date,
+                tardy_hours=max((end - task.due_date).total_seconds() / 3600.0, 0.0),
+                note=note,
+            ))
+            cursor = end
+    return scheduled
+
+
 def _schedule_tasks_mode_b_v2(
     tasks: list[OperationTask],
     capacities: dict[str, WorkCenterCapacity],
@@ -1052,15 +1114,15 @@ def _schedule_tasks_mode_b_v2(
     start_period = _optimization_start_period(config)
     if progress is not None:
         progress(
-            f"ModeB 100%产能优化建议: 先执行 ModeA 无限产能倒排，工序 {len(tasks):,} 条；"
+            f"ModeB 100%产能优化建议: 先从优化开始周期前推负荷，工序 {len(tasks):,} 条；"
             f"优化粒度 {granularity}，优化开始周期 {_period_label_from_start(start_period, config) if start_period else '未指定'}；"
             f"在每个{granularity}内按整数产品数量分配原工作中心、可选工作中心和外包；"
             f"记录参考规模 {max_window_tasks:,} 条工序/周期，求解时间上限 "
             f"{config.mode_b_solver_max_seconds if config else 60.0} 秒"
         )
 
-    baseline = _schedule_tasks_infinite_capacity(tasks, config=config)
-    _mark_analysis_items(baseline, status="ModeA倒排基线", source="ModeA", window_type="优化基线")
+    baseline = _schedule_tasks_modeb_forward_projection(tasks, config=config)
+    _mark_analysis_items(baseline, status="ModeB前推基线", source="ModeB", window_type="优化基线")
     bottleneck_report = _build_bottleneck_report(baseline, capacities, config=config)
     bottleneck_workcenters = {
         str(row["工作中心"])
@@ -1070,7 +1132,7 @@ def _schedule_tasks_mode_b_v2(
     if result is not None:
         result.bottleneck_report = bottleneck_report
     if progress is not None:
-        progress(f"ModeB瓶颈识别: 基于 ModeA 倒排周期识别瓶颈工作中心 {len(bottleneck_workcenters)} 个")
+        progress(f"ModeB瓶颈识别: 基于优化开始周期前推负荷识别瓶颈工作中心 {len(bottleneck_workcenters)} 个")
 
     route_started = time.perf_counter()
     final_items, allocations, option_rows, optimization_summary, optimization_stats = _optimize_modeb_integer_allocations(
@@ -1458,13 +1520,13 @@ def _modeb_period_for_item(
     *,
     config: FortuneBjConfig | None,
 ) -> tuple[str, datetime, datetime]:
-    if item.task.adjusted_to_start_period:
-        start = _optimization_period_start(item.task, config)
-        end = _optimization_period_end(start, config)
-        period = _period_label_from_start(start, config)
-        return period, start, end
-    period = _reporting_period_label_for_item(item, config=config)
-    start, end = _period_bounds_from_label(period, config)
+    anchor = item.start
+    modeb_start = _optimization_start_period(config)
+    if modeb_start is not None and anchor < modeb_start:
+        anchor = modeb_start
+    start = _period_start_for_date(anchor, config)
+    end = _optimization_period_end(start, config)
+    period = _period_label_from_start(start, config)
     return period, start, end
 
 
@@ -1558,22 +1620,29 @@ def _modeb_baseline_load_from_items(
     for item in baseline_items:
         if item.task.is_outsource or item.task.missing_work_center:
             continue
-        period, _, _ = _modeb_period_for_item(item, config=config)
         quantity = _modeb_quantity_units(item.task)
         unit_hours = _modeb_unit_hours(item.task)
-        load[(period, item.task.work_center)] = load.get((period, item.task.work_center), 0.0) + quantity * unit_hours
+        for period, _period_start, _period_end, hours in _modeb_item_period_load_segments(
+            item,
+            quantity * unit_hours,
+            config=config,
+        ):
+            load[(period, item.task.work_center)] = load.get((period, item.task.work_center), 0.0) + hours
     return load
 
 
 def _modeb_allocation_load(
     allocations: list[ModeBAllocation],
+    *,
+    config: FortuneBjConfig | None,
 ) -> dict[tuple[str, str], float]:
     load: dict[tuple[str, str], float] = {}
     for allocation in allocations:
         if allocation.is_outsource or allocation.is_unmaintained_work_center:
             continue
-        key = (allocation.period, allocation.destination_work_center)
-        load[key] = load.get(key, 0.0) + allocation.load_hours
+        for segment in _modeb_allocation_period_segments(allocation, config=config):
+            key = (segment.period, allocation.destination_work_center)
+            load[key] = load.get(key, 0.0) + segment.load_hours
     return load
 
 
@@ -1695,7 +1764,7 @@ def _optimize_modeb_integer_allocations(
     config: FortuneBjConfig | None,
     progress: ProgressCallback | None = None,
 ) -> tuple[list[ScheduledOperation], list[ModeBAllocation], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Choose integer product quantities per route inside each ModeA period."""
+    """Choose integer product quantities per route inside each ModeB analysis period."""
     from ortools.sat.python import cp_model
 
     started = time.perf_counter()
@@ -1974,7 +2043,7 @@ def _optimize_modeb_integer_allocations(
             if allocation is not None:
                 allocations.append(allocation)
 
-    optimized_load = _modeb_allocation_load(allocations)
+    optimized_load = _modeb_allocation_load(allocations, config=config)
     summary = _build_capacity_optimization_summary(baseline_load, optimized_load, capacities, config=config)
     option_rows = _build_modeb_optional_allocation_rows(allocations, config=config)
     final_items = [_allocation_to_scheduled_operation(allocation) for allocation in allocations]
@@ -1987,7 +2056,7 @@ def _optimize_modeb_integer_allocations(
         "说明": (
             "OR-Tools已按周期和整数产品数量分配原工作中心、可选工作中心和外包"
             if solved
-            else "OR-Tools未在时间上限内返回可行分配，报告保留ModeA原路径"
+            else "OR-Tools未在时间上限内返回可行分配，报告保留原工作中心路径"
         ),
         "输入工序数": len(records),
         "候选决策工序数": candidate_decision_count,
@@ -2026,44 +2095,48 @@ def _build_modeb_optional_allocation_rows(
             task.is_outsource and allocation.is_outsource
         ):
             continue
-        rows.append({
-            "周期": allocation.period,
-            "周期日期跨度": _period_span_from_bounds(allocation.period_start, allocation.period_end),
-            "订单": task.order_id,
-            "物料": task.material,
-            "活动": _activity_key(task.activity),
-            "工序短文本": task.process_text,
-            "紧急类型": task.urgent_type,
-            "订单优先级": task.priority_rank,
-            "优先级类型": task.priority_type,
-            "优先级原因": task.priority_reason,
-            "原始供给日期": (task.original_due_date or task.due_date).strftime("%Y-%m-%d"),
-            "调整后供给日期": task.due_date.strftime("%Y-%m-%d"),
-            "原工作中心": task.work_center,
-            "建议工作中心": allocation.destination_work_center,
-            "原资源组分类": task.resource_group,
-            "建议资源组分类": allocation.destination_resource_group,
-            "分配产品数量": allocation.quantity,
-            "原单位工时": round(allocation.original_unit_hours, 4),
-            "建议单位工时": round(allocation.unit_hours, 4),
-            "产能计算类型": allocation.capacity_calc_type,
-            "热处/表处类型": allocation.hot_surface_type,
-            "工艺兼容组": allocation.process_group,
-            "单件容量占用": round(allocation.unit_capacity, 4),
-            "容量占用": round(allocation.capacity_load_units, 3),
-            "单炉容量": round(allocation.batch_capacity, 3) if allocation.batch_capacity else "",
-            "单炉周期小时": round(allocation.batch_cycle_hours, 3) if allocation.batch_cycle_hours else "",
-            "折算炉次": round(allocation.batch_count, 3) if allocation.batch_count else "",
-            "流水线吞吐率": round(allocation.line_throughput_rate, 3) if allocation.line_throughput_rate else "",
-            "单件在炉时间小时": round(allocation.residence_hours, 3) if allocation.residence_hours else "",
-            "原工作中心减少负荷小时": round(allocation.quantity * allocation.original_unit_hours, 3),
-            "建议工作中心增加负荷小时": round(allocation.load_hours, 3),
-            "外包释放本厂工时": round(allocation.original_released_hours, 3) if allocation.is_outsource else 0,
-            "额外工时": round(allocation.extra_hours, 3),
-            "是否外包": "是" if allocation.is_outsource else "否",
-            "选择方式": "OR-Tools整数产品数量优化",
-            "说明": "最小分配单位为1件产品；外包不占用厂内产能，按7天日历返回",
-        })
+        segments = _modeb_allocation_period_segments(allocation, config=config)
+        for segment_index, segment in enumerate(segments, start=1):
+            rows.append({
+                "周期": segment.period,
+                "周期日期跨度": _period_span_from_bounds(segment.period_start, segment.period_end),
+                "订单": task.order_id,
+                "物料": task.material,
+                "活动": _activity_key(task.activity),
+                "工序短文本": task.process_text,
+                "紧急类型": task.urgent_type,
+                "订单优先级": task.priority_rank,
+                "优先级类型": task.priority_type,
+                "优先级原因": task.priority_reason,
+                "原始供给日期": (task.original_due_date or task.due_date).strftime("%Y-%m-%d"),
+                "调整后供给日期": task.due_date.strftime("%Y-%m-%d"),
+                "原工作中心": task.work_center,
+                "建议工作中心": allocation.destination_work_center,
+                "原资源组分类": task.resource_group,
+                "建议资源组分类": allocation.destination_resource_group,
+                "分配产品数量": allocation.quantity,
+                "周期拆分行": f"{segment_index}/{len(segments)}",
+                "原单位工时": round(allocation.original_unit_hours, 4),
+                "建议单位工时": round(allocation.unit_hours, 4),
+                "产能计算类型": allocation.capacity_calc_type,
+                "热处/表处类型": allocation.hot_surface_type,
+                "工艺兼容组": allocation.process_group,
+                "单件容量占用": round(allocation.unit_capacity, 4),
+                "容量占用": round(segment.capacity_load_units, 3),
+                "容量占用总量": round(allocation.capacity_load_units, 3),
+                "单炉容量": round(allocation.batch_capacity, 3) if allocation.batch_capacity else "",
+                "单炉周期小时": round(allocation.batch_cycle_hours, 3) if allocation.batch_cycle_hours else "",
+                "折算炉次": round(allocation.batch_count, 3) if allocation.batch_count else "",
+                "流水线吞吐率": round(allocation.line_throughput_rate, 3) if allocation.line_throughput_rate else "",
+                "单件在炉时间小时": round(allocation.residence_hours, 3) if allocation.residence_hours else "",
+                "原工作中心减少负荷小时": round(segment.original_released_hours or segment.original_load_hours, 3),
+                "建议工作中心增加负荷小时": 0 if allocation.is_outsource else round(segment.load_hours, 3),
+                "外包释放本厂工时": round(segment.original_released_hours, 3) if allocation.is_outsource else 0,
+                "额外工时": round(segment.extra_hours, 3),
+                "是否外包": "是" if allocation.is_outsource else "否",
+                "选择方式": "OR-Tools整数产品数量优化",
+                "说明": "最小分配单位为1件产品；负荷小时按工序前推时间跨周期拆分；外包不占用厂内产能，按7天日历返回",
+            })
     rows.sort(key=lambda row: (row["周期"], row["订单"], row["活动"], row["建议工作中心"]))
     return rows
 
@@ -2110,59 +2183,70 @@ def _build_modeb_order_allocation_rows(
             action = "转可选工作中心"
         else:
             action = "保留原工作中心"
-        rows.append({
-            "订单": task.order_id,
-            "物料": task.material,
-            "活动": _activity_key(task.activity),
-            "工序短文本": task.process_text,
-            "源文件行号": task.source_row or "",
-            "原始供给日期": (task.original_due_date or task.due_date).strftime("%Y-%m-%d"),
-            "调整后供给日期": task.due_date.strftime("%Y-%m-%d"),
-            "需求日期": task.due_date.strftime("%Y-%m-%d"),
-            "紧急类型": task.urgent_type,
-            "是否紧急": "是" if task.urgent else "否",
-            "订单优先级": task.priority_rank,
-            "优先级类型": task.priority_type,
-            "优先级原因": task.priority_reason,
-            "是否手动紧急": "是" if task.manual_urgent else "否",
-            "是否过期转入优化开始周期": "是" if task.adjusted_to_start_period else "否",
-            "是否未维护工作中心": "是" if allocation.is_unmaintained_work_center else "否",
-            "周期": allocation.period,
-            "周期日期跨度": _period_span_from_bounds(allocation.period_start, allocation.period_end),
-            "原工序总产品数量": _modeb_quantity_units(task),
-            "本行分配产品数量": allocation.quantity,
-            "同工序分配行": f"{split_index[identity]}/{split_counts[identity]}",
-            "原工作中心": task.work_center,
-            "原资源组分类": task.resource_group,
-            "原单位工时": round(allocation.original_unit_hours, 4),
-            "原路径负荷小时(按本行数量)": round(original_load_for_quantity, 3),
-            "优化动作": action,
-            "优化后工作中心": allocation.destination_work_center,
-            "优化后资源组分类": allocation.destination_resource_group,
-            "优化后单位工时": round(allocation.unit_hours, 4),
-            "产能计算类型": allocation.capacity_calc_type,
-            "热处/表处类型": allocation.hot_surface_type,
-            "工艺兼容组": allocation.process_group,
-            "单件容量占用": round(allocation.unit_capacity, 4),
-            "容量占用": round(allocation.capacity_load_units, 3),
-            "单炉容量": round(allocation.batch_capacity, 3) if allocation.batch_capacity else "",
-            "单炉周期小时": round(allocation.batch_cycle_hours, 3) if allocation.batch_cycle_hours else "",
-            "折算炉次": round(allocation.batch_count, 3) if allocation.batch_count else "",
-            "流水线吞吐率": round(allocation.line_throughput_rate, 3) if allocation.line_throughput_rate else "",
-            "单件在炉时间小时": round(allocation.residence_hours, 3) if allocation.residence_hours else "",
-            "优化后厂内负荷小时": round(0.0 if allocation.is_unmaintained_work_center else allocation.load_hours, 3),
-            "原工作中心释放小时": round(original_load_for_quantity if changed and not allocation.is_unmaintained_work_center else 0.0, 3),
-            "未维护负荷小时": round(allocation.unmaintained_load_hours, 3),
-            "外包释放本厂工时": round(allocation.original_released_hours, 3) if allocation.is_outsource else 0,
-            "额外工时": round(allocation.extra_hours, 3),
-            "是否外包": "是" if allocation.is_outsource else "否",
-            "外包返回日历天": 7 if allocation.is_outsource else "",
-            "说明": (
-                "未维护工作中心，未参与ModeB可选工序/外包优化；未维护负荷单独报告"
-                if allocation.is_unmaintained_work_center
-                else ("最小分配单位为1件产品；同一工序可按整数件拆到多个路径" if split_counts[identity] > 1 else "")
-            ),
-        })
+        segments = _modeb_allocation_period_segments(allocation, config=config)
+        for segment_index, segment in enumerate(segments, start=1):
+            rows.append({
+                "订单": task.order_id,
+                "物料": task.material,
+                "活动": _activity_key(task.activity),
+                "工序短文本": task.process_text,
+                "源文件行号": task.source_row or "",
+                "原始供给日期": (task.original_due_date or task.due_date).strftime("%Y-%m-%d"),
+                "调整后供给日期": task.due_date.strftime("%Y-%m-%d"),
+                "需求日期": task.due_date.strftime("%Y-%m-%d"),
+                "紧急类型": task.urgent_type,
+                "是否紧急": "是" if task.urgent else "否",
+                "订单优先级": task.priority_rank,
+                "优先级类型": task.priority_type,
+                "优先级原因": task.priority_reason,
+                "是否手动紧急": "是" if task.manual_urgent else "否",
+                "是否过期转入优化开始周期": "是" if task.adjusted_to_start_period else "否",
+                "是否未维护工作中心": "是" if allocation.is_unmaintained_work_center else "否",
+                "周期": segment.period,
+                "周期粒度": _optimization_granularity(config),
+                "周期日期跨度": _period_span_from_bounds(segment.period_start, segment.period_end),
+                "原工序总产品数量": _modeb_quantity_units(task),
+                "本行分配产品数量": allocation.quantity,
+                "同工序分配行": f"{split_index[identity]}/{split_counts[identity]}",
+                "同分配周期拆分行": f"{segment_index}/{len(segments)}",
+                "原工作中心": task.work_center,
+                "原资源组分类": task.resource_group,
+                "原单位工时": round(allocation.original_unit_hours, 4),
+                "原路径总负荷小时(按本行数量)": round(original_load_for_quantity, 3),
+                "原路径本周期负荷小时": round(segment.original_load_hours, 3),
+                "优化动作": action,
+                "优化后工作中心": allocation.destination_work_center,
+                "优化后资源组分类": allocation.destination_resource_group,
+                "优化后单位工时": round(allocation.unit_hours, 4),
+                "产能计算类型": allocation.capacity_calc_type,
+                "热处/表处类型": allocation.hot_surface_type,
+                "工艺兼容组": allocation.process_group,
+                "单件容量占用": round(allocation.unit_capacity, 4),
+                "容量占用": round(segment.capacity_load_units, 3),
+                "容量占用总量": round(allocation.capacity_load_units, 3),
+                "单炉容量": round(allocation.batch_capacity, 3) if allocation.batch_capacity else "",
+                "单炉周期小时": round(allocation.batch_cycle_hours, 3) if allocation.batch_cycle_hours else "",
+                "折算炉次": round(allocation.batch_count, 3) if allocation.batch_count else "",
+                "流水线吞吐率": round(allocation.line_throughput_rate, 3) if allocation.line_throughput_rate else "",
+                "单件在炉时间小时": round(allocation.residence_hours, 3) if allocation.residence_hours else "",
+                "本周期负荷小时": round(0.0 if allocation.is_unmaintained_work_center else segment.load_hours, 3),
+                "优化后厂内负荷小时": round(0.0 if allocation.is_unmaintained_work_center else segment.load_hours, 3),
+                "原工作中心释放小时": round(segment.original_load_hours if changed and not allocation.is_unmaintained_work_center else 0.0, 3),
+                "未维护负荷小时": round(segment.unmaintained_load_hours, 3),
+                "外包释放本厂工时": round(segment.original_released_hours, 3) if allocation.is_outsource else 0,
+                "额外工时": round(segment.extra_hours, 3),
+                "是否外包": "是" if allocation.is_outsource else "否",
+                "外包返回日历天": 7 if allocation.is_outsource else "",
+                "说明": (
+                    "未维护工作中心，未参与ModeB可选工序/外包优化；未维护负荷按周期拆分后单独报告"
+                    if allocation.is_unmaintained_work_center
+                    else (
+                        "最小分配单位为1件产品；负荷小时按工序前推时间跨周期拆分；同一工序可按整数件拆到多个路径"
+                        if split_counts[identity] > 1
+                        else "负荷小时按工序前推时间跨周期拆分；产品数量为涉及数量，不代表周期内完成数量"
+                    )
+                ),
+            })
     return rows
 
 
@@ -2571,41 +2655,46 @@ def _build_modeb_period_capacity_report_from_allocations(
     for item in baseline_items:
         if item.task.is_outsource or item.task.missing_work_center:
             continue
-        period, period_start, period_end = _modeb_period_for_item(item, config=config)
-        key = (period, item.task.work_center)
         quantity = _modeb_quantity_units(item.task)
         load_hours = quantity * _modeb_unit_hours(item.task)
-        bucket = before.setdefault(key, {
-            "period_start": period_start,
-            "period_end": period_end,
-            "resource_group": item.task.resource_group,
-            "operation_count": 0,
-            "quantity": 0,
-            "load_hours": 0.0,
-        })
-        bucket["operation_count"] += 1
-        bucket["quantity"] += quantity
-        bucket["load_hours"] += load_hours
+        for period, period_start, period_end, segment_hours in _modeb_item_period_load_segments(
+            item,
+            load_hours,
+            config=config,
+        ):
+            key = (period, item.task.work_center)
+            bucket = before.setdefault(key, {
+                "period_start": period_start,
+                "period_end": period_end,
+                "resource_group": item.task.resource_group,
+                "operation_count": 0,
+                "quantity": 0,
+                "load_hours": 0.0,
+            })
+            bucket["operation_count"] += 1
+            bucket["quantity"] += quantity
+            bucket["load_hours"] += segment_hours
 
     for allocation in allocations:
-        original_key = (allocation.period, allocation.source_item.task.work_center)
         if allocation.is_unmaintained_work_center:
             continue
-        if allocation.is_outsource:
-            outsource_release[original_key] = outsource_release.get(original_key, 0.0) + allocation.original_released_hours
-            continue
-        key = (allocation.period, allocation.destination_work_center)
-        bucket = after.setdefault(key, {
-            "period_start": allocation.period_start,
-            "period_end": allocation.period_end,
-            "resource_group": allocation.destination_resource_group,
-            "operation_count": 0,
-            "quantity": 0,
-            "load_hours": 0.0,
-        })
-        bucket["operation_count"] += 1
-        bucket["quantity"] += allocation.quantity
-        bucket["load_hours"] += allocation.load_hours
+        for segment in _modeb_allocation_period_segments(allocation, config=config):
+            original_key = (segment.period, allocation.source_item.task.work_center)
+            if allocation.is_outsource:
+                outsource_release[original_key] = outsource_release.get(original_key, 0.0) + segment.original_released_hours
+                continue
+            key = (segment.period, allocation.destination_work_center)
+            bucket = after.setdefault(key, {
+                "period_start": segment.period_start,
+                "period_end": segment.period_end,
+                "resource_group": allocation.destination_resource_group,
+                "operation_count": 0,
+                "quantity": 0,
+                "load_hours": 0.0,
+            })
+            bucket["operation_count"] += 1
+            bucket["quantity"] += allocation.quantity
+            bucket["load_hours"] += segment.load_hours
 
     keys = sorted(set(before) | set(after) | set(outsource_release), key=lambda item: (item[0], item[1]))
     rows: list[dict[str, Any]] = []
@@ -2673,28 +2762,29 @@ def _build_modeb_period_report_from_allocations(
     status: str,
 ) -> list[dict[str, Any]]:
     by_period: dict[str, dict[str, Any]] = {}
-    load_by_period_wc = _modeb_allocation_load(allocations)
+    load_by_period_wc = _modeb_allocation_load(allocations, config=config)
     for allocation in allocations:
         if allocation.is_unmaintained_work_center:
             continue
         task = allocation.source_item.task
-        bucket = by_period.setdefault(allocation.period, {
-            "period_start": allocation.period_start,
-            "period_end": allocation.period_end,
-            "orders": set(),
-            "source_operations": set(),
-            "allocation_rows": 0,
-            "quantity": 0,
-            "outsource_quantity": 0,
-            "outsource_release": 0.0,
-        })
-        bucket["orders"].add(task.order_id)
-        bucket["source_operations"].add(_schedule_task_identity(task))
-        bucket["allocation_rows"] += 1
-        bucket["quantity"] += allocation.quantity
-        if allocation.is_outsource:
-            bucket["outsource_quantity"] += allocation.quantity
-            bucket["outsource_release"] += allocation.original_released_hours
+        for segment in _modeb_allocation_period_segments(allocation, config=config):
+            bucket = by_period.setdefault(segment.period, {
+                "period_start": segment.period_start,
+                "period_end": segment.period_end,
+                "orders": set(),
+                "source_operations": set(),
+                "allocation_rows": 0,
+                "quantity": 0,
+                "outsource_quantity": 0,
+                "outsource_release": 0.0,
+            })
+            bucket["orders"].add(task.order_id)
+            bucket["source_operations"].add(_schedule_task_identity(task))
+            bucket["allocation_rows"] += 1
+            bucket["quantity"] += allocation.quantity
+            if allocation.is_outsource:
+                bucket["outsource_quantity"] += allocation.quantity
+                bucket["outsource_release"] += segment.original_released_hours
 
     rows: list[dict[str, Any]] = []
     for index, period in enumerate(sorted(by_period), start=1):
@@ -2729,7 +2819,7 @@ def _build_modeb_period_report_from_allocations(
             "优化后总缺口小时": round(shortage, 2),
             "状态": status,
             "耗时秒": solve_seconds,
-            "说明": "按ModeA倒排落入本周期的工序进行整数产品数量优化；超100%负荷保留并进入解决建议",
+            "说明": "OR-Tools按工序起始优化周期做整数产品数量路径分配；本页负荷小时按工序前推时间跨周期拆分，产品数量为涉及数量，不代表周期内完成数量",
         })
     return rows
 
@@ -2746,33 +2836,34 @@ def _build_hot_surface_capacity_report(
     for allocation in allocations:
         if allocation.is_outsource or allocation.is_unmaintained_work_center or allocation.capacity_calc_type not in {"批量处理", "流水线处理"}:
             continue
-        key = (
-            allocation.period,
-            allocation.destination_work_center,
-            allocation.capacity_calc_type,
-            allocation.hot_surface_type,
-            allocation.process_group,
-        )
-        bucket = buckets.setdefault(key, {
-            "period_start": allocation.period_start,
-            "period_end": allocation.period_end,
-            "resource_group": allocation.destination_resource_group,
-            "orders": set(),
-            "source_operations": set(),
-            "quantity": 0,
-            "capacity_units": 0.0,
-            "load_hours": 0.0,
-            "batch_capacity": allocation.batch_capacity,
-            "batch_cycle_hours": allocation.batch_cycle_hours,
-            "line_throughput_rate": allocation.line_throughput_rate,
-            "residence_hours": allocation.residence_hours,
-        })
-        task = allocation.source_item.task
-        bucket["orders"].add(task.order_id)
-        bucket["source_operations"].add(_schedule_task_identity(task))
-        bucket["quantity"] += allocation.quantity
-        bucket["capacity_units"] += allocation.capacity_load_units
-        bucket["load_hours"] += allocation.load_hours
+        for segment in _modeb_allocation_period_segments(allocation, config=config):
+            key = (
+                segment.period,
+                allocation.destination_work_center,
+                allocation.capacity_calc_type,
+                allocation.hot_surface_type,
+                allocation.process_group,
+            )
+            bucket = buckets.setdefault(key, {
+                "period_start": segment.period_start,
+                "period_end": segment.period_end,
+                "resource_group": allocation.destination_resource_group,
+                "orders": set(),
+                "source_operations": set(),
+                "quantity": 0,
+                "capacity_units": 0.0,
+                "load_hours": 0.0,
+                "batch_capacity": allocation.batch_capacity,
+                "batch_cycle_hours": allocation.batch_cycle_hours,
+                "line_throughput_rate": allocation.line_throughput_rate,
+                "residence_hours": allocation.residence_hours,
+            })
+            task = allocation.source_item.task
+            bucket["orders"].add(task.order_id)
+            bucket["source_operations"].add(_schedule_task_identity(task))
+            bucket["quantity"] += allocation.quantity
+            bucket["capacity_units"] += segment.capacity_load_units
+            bucket["load_hours"] += segment.load_hours
 
     rows: list[dict[str, Any]] = []
     for (period, work_center, calc_type, hot_type, process_group), bucket in sorted(buckets.items()):
@@ -3130,6 +3221,96 @@ def _month_days(month: str) -> int:
         return 30
 
 
+def _split_hours_by_reporting_period(
+    start: datetime,
+    end: datetime,
+    total_hours: float,
+    *,
+    config: FortuneBjConfig | None = None,
+) -> list[tuple[str, datetime, datetime, float]]:
+    total_hours = max(float(total_hours or 0.0), 0.0)
+    if total_hours <= 0:
+        return []
+    if end <= start:
+        period_start = _period_start_for_date(start, config)
+        period_end = _optimization_period_end(period_start, config)
+        return [(_period_label_from_start(period_start, config), period_start, period_end, total_hours)]
+
+    elapsed_hours = (end - start).total_seconds() / 3600.0
+    if elapsed_hours <= 0:
+        period_start = _period_start_for_date(start, config)
+        period_end = _optimization_period_end(period_start, config)
+        return [(_period_label_from_start(period_start, config), period_start, period_end, total_hours)]
+
+    parts: list[tuple[str, datetime, datetime, float]] = []
+    cursor = start
+    while cursor < end:
+        period_start = _period_start_for_date(cursor, config)
+        period_end = _optimization_period_end(period_start, config)
+        segment_end = min(end, period_end)
+        segment_elapsed_hours = (segment_end - cursor).total_seconds() / 3600.0
+        if segment_elapsed_hours > 0:
+            parts.append((
+                _period_label_from_start(period_start, config),
+                period_start,
+                period_end,
+                total_hours * segment_elapsed_hours / elapsed_hours,
+            ))
+        cursor = segment_end
+    return parts
+
+
+def _modeb_item_period_load_segments(
+    item: ScheduledOperation,
+    total_hours: float,
+    *,
+    config: FortuneBjConfig | None,
+) -> list[tuple[str, datetime, datetime, float]]:
+    total_hours = max(float(total_hours or 0.0), 0.0)
+    if total_hours <= 0:
+        return []
+    start = item.start
+    modeb_start = _optimization_start_period(config)
+    if modeb_start is not None and start < modeb_start:
+        start = modeb_start
+    end = item.end
+    if end <= start:
+        end = start + timedelta(hours=max(total_hours, 1.0))
+    return _split_hours_by_reporting_period(start, end, total_hours, config=config)
+
+
+def _modeb_allocation_period_segments(
+    allocation: ModeBAllocation,
+    *,
+    config: FortuneBjConfig | None,
+) -> list[ModeBAllocationPeriodSegment]:
+    weights = _modeb_item_period_load_segments(allocation.source_item, 1.0, config=config)
+    if not weights:
+        weights = [(allocation.period, allocation.period_start, allocation.period_end, 1.0)]
+    weight_total = sum(float(hours) for _period, _start, _end, hours in weights)
+    if weight_total <= 0:
+        weights = [(allocation.period, allocation.period_start, allocation.period_end, 1.0)]
+        weight_total = 1.0
+
+    original_load_hours = allocation.quantity * allocation.original_unit_hours
+    segments: list[ModeBAllocationPeriodSegment] = []
+    for period, period_start, period_end, weight_hours in weights:
+        ratio = max(float(weight_hours) / weight_total, 0.0)
+        segments.append(ModeBAllocationPeriodSegment(
+            allocation=allocation,
+            period=period,
+            period_start=period_start,
+            period_end=period_end,
+            load_hours=allocation.load_hours * ratio,
+            original_load_hours=original_load_hours * ratio,
+            original_released_hours=allocation.original_released_hours * ratio,
+            extra_hours=allocation.extra_hours * ratio,
+            unmaintained_load_hours=allocation.unmaintained_load_hours * ratio,
+            capacity_load_units=allocation.capacity_load_units * ratio,
+        ))
+    return segments
+
+
 def _split_item_hours_by_reporting_period(
     item: ScheduledOperation,
     *,
@@ -3138,6 +3319,12 @@ def _split_item_hours_by_reporting_period(
     if _optimization_granularity(config) == "周":
         return _split_item_hours_by_week(item, config=config)
     return _split_item_hours_by_month(item)
+
+
+def _operation_total_load_hours(task: OperationTask) -> float:
+    if task.duration_hours > 0:
+        return max(float(task.duration_hours), 0.0)
+    return max(float(task.quantity or 0.0) * float(task.unit_hours or 0.0), 0.0)
 
 
 def _split_item_hours_by_week(
@@ -3151,7 +3338,7 @@ def _split_item_hours_by_week(
     elapsed_hours = (item.end - item.start).total_seconds() / 3600.0
     if elapsed_hours <= 0:
         return []
-    load_hours = max(float(item.task.duration_hours), 0.0)
+    load_hours = _operation_total_load_hours(item.task)
     cursor = item.start
     while cursor < item.end:
         next_week = _week_start(cursor) + timedelta(days=7)
@@ -3170,7 +3357,7 @@ def _split_item_hours_by_month(item: ScheduledOperation) -> list[tuple[str, floa
     elapsed_hours = (item.end - item.start).total_seconds() / 3600.0
     if elapsed_hours <= 0:
         return []
-    load_hours = max(float(item.task.duration_hours), 0.0)
+    load_hours = _operation_total_load_hours(item.task)
     cursor = item.start
     while cursor < item.end:
         next_month = _month_add(_month_start(cursor), 1)
@@ -3180,6 +3367,32 @@ def _split_item_hours_by_month(item: ScheduledOperation) -> list[tuple[str, floa
             parts.append((cursor.strftime("%Y-%m"), load_hours * segment_elapsed_hours / elapsed_hours))
         cursor = segment_end
     return parts
+
+
+def _scheduled_item_period_load_segments(
+    item: ScheduledOperation,
+    *,
+    config: FortuneBjConfig | None = None,
+) -> list[tuple[str, str, float]]:
+    parts = _split_item_hours_by_reporting_period(item, config=config)
+    if not parts:
+        period = _reporting_period_label_for_item(item, config=config)
+        return [(period, _period_date_span(period, config), round(_operation_total_load_hours(item.task), 3))]
+
+    total_hours = round(_operation_total_load_hours(item.task), 3)
+    rounded_parts = [(period, round(max(float(hours), 0.0), 3)) for period, hours in parts]
+    diff = round(total_hours - sum(hours for _period, hours in rounded_parts), 3)
+    if rounded_parts and abs(diff) >= 0.001:
+        last_period, last_hours = rounded_parts[-1]
+        rounded_parts[-1] = (last_period, round(max(last_hours + diff, 0.0), 3))
+    return [
+        (period, _period_date_span(period, config), hours)
+        for period, hours in rounded_parts
+    ]
+
+
+def _schedule_detail_row_count(items: list[ScheduledOperation], *, config: FortuneBjConfig | None = None) -> int:
+    return sum(max(len(_scheduled_item_period_load_segments(item, config=config)), 1) for item in items)
 
 
 def _apply_optional_operations(
@@ -3222,7 +3435,7 @@ def _apply_optional_operations(
             "可选工作中心增加负荷小时": round(0 if selected.is_outsource else new_duration, 3),
             "外包增加工时": OUTSOURCE_DURATION_HOURS if selected.is_outsource else 0,
             "是否外包": "是" if selected.is_outsource else "否",
-            "说明": "原工作中心在 ModeA 负荷中识别为瓶颈，已按规则分流用于有限产能模拟",
+            "说明": "原工作中心在基线负荷中识别为瓶颈，已按规则分流用于有限产能模拟",
         })
     return adjusted, rows
 
@@ -3587,9 +3800,10 @@ def write_report(
     wb = Workbook()
     wb.remove(wb.active)
     report_started_at = time.perf_counter()
+    schedule_detail_rows = 0 if is_mode_b else _schedule_detail_row_count(result.scheduled, config=config)
     total_report_rows = (
         5
-        + (0 if is_mode_b else len(result.scheduled))
+        + schedule_detail_rows
         + max(len(result.bottleneck_report), 1)
         + max(len(result.monthly_capacity_report), 1)
         + (max(len(result.order_operation_allocation_report), 1) if is_mode_b else 0)
@@ -3642,6 +3856,7 @@ def write_report(
             "订单工序分配明细",
             result.scheduled,
             include_outsource=False,
+            config=config,
             progress=progress,
             report_started_at=report_started_at,
             written_rows=written_rows,
@@ -4194,6 +4409,7 @@ def _write_schedule_sheet(
     title: str,
     items: list[ScheduledOperation],
     include_outsource: bool,
+    config: FortuneBjConfig | None = None,
     progress: ProgressCallback | None = None,
     report_started_at: float | None = None,
     written_rows: int = 0,
@@ -4202,61 +4418,62 @@ def _write_schedule_sheet(
     ws = wb.create_sheet(title)
     headers = [
         "订单", "活动", "物料", "工序短文本", "工作中心", "资源组分类", "订单数量",
-        "单位工时(小时/pcs)", "工序生产时间(小时)", "开始时间", "完成时间", "需求日期",
+        "单位工时(小时/pcs)", "工序生产时间(小时)", "本周期负荷小时", "开始时间", "完成时间", "需求日期",
         "原始供给日期", "调整后供给日期", "紧急类型", "是否紧急", "订单优先级", "优先级类型", "优先级原因",
         "是否手动紧急", "是否过期转入优化开始周期", "是否热处/表处", "是否外协", "是否未维护工作中心",
+        "周期", "周期粒度", "周期日期跨度",
         "未维护负荷小时",
         "分析口径", "分析来源", "窗口编号", "窗口类型", "说明",
     ]
     ws.append(headers)
     sorted_items = sorted(items, key=lambda x: (x.start, x.task.order_id, x.task.activity))
-    for row_number, item in enumerate(sorted_items, start=1):
-        ws.append([
-            item.task.order_id,
-            item.task.activity,
-            item.task.material,
-            item.task.process_text,
-            item.task.work_center,
-            item.task.resource_group,
-            item.task.quantity,
-            item.task.unit_hours,
-            item.task.duration_hours,
-            item.start.strftime("%Y-%m-%d %H:%M"),
-            item.end.strftime("%Y-%m-%d %H:%M"),
-            item.task.due_date.strftime("%Y-%m-%d %H:%M"),
-            (item.task.original_due_date or item.task.due_date).strftime("%Y-%m-%d %H:%M"),
-            item.task.due_date.strftime("%Y-%m-%d %H:%M"),
-            item.task.urgent_type,
-            "是" if item.task.urgent else "否",
-            item.task.priority_rank,
-            item.task.priority_type,
-            item.task.priority_reason,
-            "是" if item.task.manual_urgent else "否",
-            "是" if item.task.adjusted_to_start_period else "否",
-            "是" if item.task.is_hot_surface else "否",
-            "是" if include_outsource or item.task.is_outsource else "否",
-            "是" if item.task.missing_work_center else "否",
-            round(
-                (
-                    item.task.duration_hours
-                    if item.task.duration_hours > 0
-                    else float(item.task.quantity or 0.0) * float(item.task.unit_hours or 0.0)
-                )
-                if item.task.missing_work_center
-                else 0.0,
-                3,
-            ),
-            item.analysis_status,
-            item.analysis_source,
-            item.window_number or "",
-            item.window_type,
-            item.note,
-        ])
-        current_written = written_rows + row_number
-        if progress is not None and report_started_at is not None and (row_number % 3000 == 0 or row_number == len(sorted_items)):
-            _emit_progress(progress, "写入报告", current_written, total_report_rows, report_started_at, f"{title} {row_number:,}/{len(sorted_items):,}")
+    total_detail_rows = _schedule_detail_row_count(sorted_items, config=config)
+    row_number = 0
+    for item in sorted_items:
+        total_load_hours = round(_operation_total_load_hours(item.task), 3)
+        for period, period_span, period_load_hours in _scheduled_item_period_load_segments(item, config=config):
+            row_number += 1
+            ws.append([
+                item.task.order_id,
+                item.task.activity,
+                item.task.material,
+                item.task.process_text,
+                item.task.work_center,
+                item.task.resource_group,
+                item.task.quantity,
+                item.task.unit_hours,
+                total_load_hours,
+                period_load_hours,
+                item.start.strftime("%Y-%m-%d %H:%M"),
+                item.end.strftime("%Y-%m-%d %H:%M"),
+                item.task.due_date.strftime("%Y-%m-%d %H:%M"),
+                (item.task.original_due_date or item.task.due_date).strftime("%Y-%m-%d %H:%M"),
+                item.task.due_date.strftime("%Y-%m-%d %H:%M"),
+                item.task.urgent_type,
+                "是" if item.task.urgent else "否",
+                item.task.priority_rank,
+                item.task.priority_type,
+                item.task.priority_reason,
+                "是" if item.task.manual_urgent else "否",
+                "是" if item.task.adjusted_to_start_period else "否",
+                "是" if item.task.is_hot_surface else "否",
+                "是" if include_outsource or item.task.is_outsource else "否",
+                "是" if item.task.missing_work_center else "否",
+                period,
+                _optimization_granularity(config),
+                period_span,
+                round(period_load_hours if item.task.missing_work_center else 0.0, 3),
+                item.analysis_status,
+                item.analysis_source,
+                item.window_number or "",
+                item.window_type,
+                item.note,
+            ])
+            current_written = written_rows + row_number
+            if progress is not None and report_started_at is not None and (row_number % 3000 == 0 or row_number == total_detail_rows):
+                _emit_progress(progress, "写入报告", current_written, total_report_rows, report_started_at, f"{title} {row_number:,}/{total_detail_rows:,}")
     _format_table(ws)
-    return written_rows + len(sorted_items)
+    return written_rows + total_detail_rows
 
 
 def _write_order_summary_sheet(

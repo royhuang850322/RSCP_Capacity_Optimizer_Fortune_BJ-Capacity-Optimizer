@@ -12,13 +12,18 @@ $ReportDirName = -join ([char[]](0x62a5, 0x544a))
 
 $DataTarget = Join-Path $DistRoot $DataDirName
 New-Item -ItemType Directory -Force -Path $DataTarget | Out-Null
-Copy-Item -Path (Join-Path (Join-Path $ProjectRoot $DataDirName) "*.csv") -Destination $DataTarget -Force
+$DataSource = Join-Path $ProjectRoot $DataDirName
+foreach ($Pattern in @("*.csv", "*.xlsx", "*.xls")) {
+    Copy-Item -Path (Join-Path $DataSource $Pattern) -Destination $DataTarget -Force -ErrorAction SilentlyContinue
+}
 
 $DemoSource = Join-Path $ProjectRoot $DemoDirName
 if (Test-Path -LiteralPath $DemoSource) {
     $DemoTarget = Join-Path $DistRoot $DemoDirName
     New-Item -ItemType Directory -Force -Path $DemoTarget | Out-Null
-    Copy-Item -Path (Join-Path $DemoSource "*.csv") -Destination $DemoTarget -Force
+    foreach ($Pattern in @("*.csv", "*.xlsx", "*.xls")) {
+        Copy-Item -Path (Join-Path $DemoSource $Pattern) -Destination $DemoTarget -Force -ErrorAction SilentlyContinue
+    }
 }
 
 $LicenseTarget = Join-Path $DistRoot "licenses\active"
