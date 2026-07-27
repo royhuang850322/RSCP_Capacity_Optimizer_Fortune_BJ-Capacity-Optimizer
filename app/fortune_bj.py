@@ -132,6 +132,7 @@ class OptionalOperation:
     alternative_work_center: str
     alternative_resource_group: str
     unit_hours: float
+    unit_hours_source: str = "可选工序表填写"
     is_outsource: bool = False
     priority_rank: int = 999
     capacity_calc_type: str = ""
@@ -199,6 +200,7 @@ class ModeBAllocation:
     destination_work_center: str
     destination_resource_group: str
     unit_hours: float
+    unit_hours_source: str
     load_hours: float
     original_unit_hours: float
     original_released_hours: float
@@ -408,6 +410,11 @@ def _blocking_demand_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]
     return [row for row in issues if str(row.get("类型") or "") in blocking_types]
 
 
+def _blocking_optional_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    blocking_types = {"缺少字段", "可选工序缺少可继承工时"}
+    return [row for row in issues if str(row.get("类型") or "") in blocking_types]
+
+
 def ensure_runtime_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -482,12 +489,18 @@ def run_fortune_bj_schedule(config: FortuneBjConfig, progress: ProgressCallback 
     capacities, capacity_issues = load_workcenter_capacities(config.workcenter_path, calendars)
     notify(f"已读取工作中心 {len(capacities)} 个，问题 {len(capacity_issues)} 条。")
     notify("读取可选工序...")
-    optional_operations, optional_issues = load_optional_operations(config.optional_operations_path, capacities)
+    operation_unit_hours = _build_operation_unit_hours_lookup(config.operations_path)
+    optional_operations, optional_issues = load_optional_operations(
+        config.optional_operations_path,
+        capacities,
+        operation_unit_hours=operation_unit_hours,
+    )
     notify(f"已读取可选工序 {len(optional_operations)} 条，问题 {len(optional_issues)} 条。")
     notify("读取订单交期数量...")
     demand_by_order, demand_issues, placeholder_due_orders = load_order_demand(config.demand_path, config)
     notify(f"已读取有效订单需求 {len(demand_by_order)} 个，问题/调整 {len(demand_issues)} 条。")
     blocking_demand_issue_rows = _blocking_demand_issues(demand_issues)
+    blocking_optional_issue_rows = _blocking_optional_issues(optional_issues)
     if placeholder_due_orders:
         placeholder_order_count = len({row["订单"] for row in placeholder_due_orders})
         notify(
@@ -508,6 +521,14 @@ def run_fortune_bj_schedule(config: FortuneBjConfig, progress: ProgressCallback 
             "说明": "订单交期数量产能分析输入文件存在阻断问题，正式产能分析已停止。",
         })
         blocking_issue_rows = [*blocking_demand_issue_rows, *blocking_issue_rows]
+    if blocking_optional_issue_rows:
+        precheck_summary.insert(0, {
+            "校验项": "可选工序输入文件",
+            "状态": "失败",
+            "问题数": len(blocking_optional_issue_rows),
+            "说明": "可选工序存在阻断问题，正式产能分析已停止。",
+        })
+        blocking_issue_rows = [*blocking_optional_issue_rows, *blocking_issue_rows]
     precheck_failed = any(row.get("状态") == "失败" for row in precheck_summary)
     if precheck_failed or missing_order_rows or blocking_issue_rows:
         precheck_report = _write_precheck_report(
@@ -665,9 +686,30 @@ def load_workcenter_capacities(
     return capacities, issues
 
 
+def _build_operation_unit_hours_lookup(path: Path) -> dict[tuple[str, str], float]:
+    df = _read_workbook_first_sheet(path)
+    required = ["物料", "活动", "标准值1", "标准值2", "标准值3"]
+    if _missing_columns_issue(df, required, path):
+        return {}
+    lookup: dict[tuple[str, str], float] = {}
+    for _idx, row in df.iterrows():
+        material = _clean_text(row.get("物料"))
+        activity = _activity_key(row.get("活动"))
+        if not material or not activity:
+            continue
+        unit_hours = sum(_to_number(row.get(col), default=0.0) for col in ("标准值1", "标准值2", "标准值3"))
+        if unit_hours <= 0:
+            continue
+        key = (material, activity)
+        lookup[key] = max(float(unit_hours), lookup.get(key, 0.0))
+    return lookup
+
+
 def load_optional_operations(
     path: Path | None,
     capacities: dict[str, WorkCenterCapacity],
+    *,
+    operation_unit_hours: dict[tuple[str, str], float] | None = None,
 ) -> tuple[dict[tuple[str, str], list[OptionalOperation]], list[dict[str, Any]]]:
     if path is None or not Path(path).exists():
         return {}, []
@@ -682,7 +724,9 @@ def load_optional_operations(
         activity = _activity_key(row.get("活动"))
         work_center = _clean_text(row.get("可选工作中心"))
         resource_group = _clean_text(row.get("可选资源组分类"))
-        unit_hours = _to_number(row.get("可选单位工时(小时/pcs)"), default=0.0)
+        unit_hours_raw = row.get("可选单位工时(小时/pcs)")
+        unit_hours = _to_number(unit_hours_raw, default=0.0)
+        unit_hours_source = "可选工序表填写"
         priority_text = _clean_text(row.get("工序优先级"))
         priority_rank = _priority_rank(priority_text)
         is_outsource = resource_group == "外包"
@@ -693,20 +737,60 @@ def load_optional_operations(
         if is_outsource:
             work_center = "外包"
             unit_hours = 0.0
-        if not material or not activity or (not is_outsource and (not work_center or unit_hours <= 0)):
-            issues.append({"类型": "可选工序异常", "文件": str(path), "行号": idx + 2, "说明": "物料、活动、可选工作中心或可选单位工时无效；外包行以可选资源组分类=外包判断，且可不填单位工时"})
+            unit_hours_source = "外包"
+        if not material or not activity or (not is_outsource and not work_center):
+            issues.append({"类型": "可选工序异常", "文件": str(path), "行号": idx + 2, "说明": "物料、活动或可选工作中心无效；外包行以可选资源组分类=外包判断，且可不填单位工时"})
             continue
         if not is_outsource and work_center not in capacities:
             issues.append({"类型": "可选工序异常", "文件": str(path), "行号": idx + 2, "说明": f"可选工作中心未在工作中心映射中定义：{work_center}"})
             continue
         if not resource_group and work_center in capacities:
             resource_group = capacities[work_center].resource_group
+        if not is_outsource and _is_blank_cell(unit_hours_raw):
+            inherited_hours = (operation_unit_hours or {}).get((material, activity), 0.0)
+            if inherited_hours <= 0:
+                issues.append({
+                    "类型": "可选工序缺少可继承工时",
+                    "文件": str(path),
+                    "行号": idx + 2,
+                    "物料": material,
+                    "活动": activity,
+                    "可选工作中心": work_center,
+                    "说明": "可选单位工时为空，且生产订单工序中找不到同物料+活动的有效单位工时，无法自动继承。",
+                    "处理建议": "请在可选工序表填写可选单位工时，或在生产订单工序表补充该物料+活动的标准值1/2/3。",
+                })
+                continue
+            unit_hours = inherited_hours
+            unit_hours_source = "从生产订单工序继承(同物料+活动最大单位工时)"
+            issues.append({
+                "类型": "可选工序工时自动继承",
+                "文件": str(path),
+                "行号": idx + 2,
+                "物料": material,
+                "活动": activity,
+                "可选工作中心": work_center,
+                "继承单位工时": round(unit_hours, 4),
+                "工时来源": unit_hours_source,
+                "说明": "可选单位工时为空，已从生产订单工序表按同物料+活动取最大单位工时自动继承。",
+            })
+        if not is_outsource and unit_hours <= 0:
+            issues.append({
+                "类型": "可选工序异常",
+                "文件": str(path),
+                "行号": idx + 2,
+                "物料": material,
+                "活动": activity,
+                "可选工作中心": work_center,
+                "说明": "可选单位工时必须大于0；如需自动继承原工时，请将该单元格留空，不要填写0。",
+            })
+            continue
         options.setdefault((material, activity), []).append(OptionalOperation(
             material=material,
             activity=activity,
             alternative_work_center=work_center,
             alternative_resource_group=resource_group or "外包",
             unit_hours=unit_hours,
+            unit_hours_source=unit_hours_source,
             is_outsource=is_outsource,
             priority_rank=priority_rank,
             capacity_calc_type=capacity_calc_type,
@@ -779,23 +863,21 @@ def load_order_demand(path: Path, config: FortuneBjConfig) -> tuple[dict[str, di
         overdue = False
         if optimization_start is not None and due_date < optimization_start:
             overdue = True
-            if config.schedule_mode == "ModeB":
-                due_date = optimization_start
-                adjusted_to_start_period = True
-                issues.append({
-                    "类型": "过期订单转入优化开始周期",
-                    "文件": str(path),
-                    "行号": idx + 2,
-                    "订单": order_id,
-                    "原交期": original_due_date.strftime("%Y-%m-%d"),
-                    "优化粒度": _optimization_granularity(config),
-                    "优化开始周期": _period_label_from_start(optimization_start, config),
-                    "优化开始周期日期跨度": _period_span_from_bounds(
-                        optimization_start,
-                        _optimization_period_end(optimization_start, config),
-                    ),
-                    "说明": "原交期早于优化开始周期，已从优化开始周期重新计算产能并按过期订单优先级处理",
-                })
+            adjusted_to_start_period = True
+            issues.append({
+                "类型": "过期订单转入优化开始周期",
+                "文件": str(path),
+                "行号": idx + 2,
+                "订单": order_id,
+                "原交期": original_due_date.strftime("%Y-%m-%d"),
+                "优化粒度": _optimization_granularity(config),
+                "优化开始周期": _period_label_from_start(optimization_start, config),
+                "优化开始周期日期跨度": _period_span_from_bounds(
+                    optimization_start,
+                    _optimization_period_end(optimization_start, config),
+                ),
+                "说明": "原交期早于优化开始周期；工具仍按原交期倒排，之后将整单工序链平移到优化开始周期起算，并按过期订单优先级处理",
+            })
         priority_rank, priority_type, priority_reason = _priority_from_flags(urgent_type, overdue)
         existing = demand.get(order_id)
         if existing is None:
@@ -990,10 +1072,16 @@ def _schedule_tasks(
             max_window_tasks=config.mode_b_max_window_tasks if config else 2000,
             progress=progress,
         )
+    start_period = _optimization_start_period(config)
     if progress is not None:
-        progress(f"ModeA无限产能倒排: {len(tasks):,} 条工序")
+        progress(
+            f"ModeA无限产能倒排: {len(tasks):,} 条工序；"
+            f"优化粒度 {_optimization_granularity(config)}，"
+            f"优化开始周期 {_period_label_from_start(start_period, config) if start_period else '未指定'}；"
+            f"逾期订单或倒排后早于优化开始周期的订单会整单平移到优化开始周期"
+        )
     scheduled = _schedule_tasks_infinite_capacity(tasks, config=config)
-    _mark_analysis_items(scheduled, status="无限产能估算", source="ModeA", window_type="全量分析")
+    _mark_analysis_items(scheduled, status="ModeA倒排平移基线", source="ModeA", window_type="全量分析")
     if result is not None:
         result.bottleneck_report = _build_bottleneck_report(scheduled, capacities, config=config)
         result.monthly_capacity_report = _build_monthly_capacity_report(scheduled, scheduled, capacities, config=config)
@@ -1005,6 +1093,33 @@ def _normalize_mode(value: str) -> str:
     if "B" in text:
         return "ModeB"
     return "ModeA"
+
+
+def _shift_order_items_to_optimization_start(
+    order_items: list[ScheduledOperation],
+    *,
+    config: FortuneBjConfig | None,
+    mode_label: str,
+) -> None:
+    optimization_start = _optimization_start_period(config)
+    if optimization_start is None or not order_items:
+        return
+    first_start = min(item.start for item in order_items)
+    order_overdue = any(item.task.overdue or item.task.adjusted_to_start_period for item in order_items)
+    starts_before_period = any(item.start < optimization_start for item in order_items)
+    if not (order_overdue or starts_before_period) or first_start >= optimization_start:
+        return
+
+    delta = optimization_start - first_start
+    for item in order_items:
+        item.start += delta
+        item.end += delta
+        item.on_time = item.end <= item.task.due_date
+        item.tardy_hours = max((item.end - item.task.due_date).total_seconds() / 3600.0, 0.0)
+        if item.task.is_outsource:
+            item.note = f"{mode_label}按交期倒排后整单平移至优化开始周期；外协固定7天，不占用本地资源"
+        else:
+            item.note = f"{mode_label}按交期倒排后整单平移至优化开始周期"
 
 
 def _schedule_tasks_infinite_capacity(
@@ -1047,18 +1162,13 @@ def _schedule_tasks_infinite_capacity(
                 note=note,
             ))
             cursor = start
-        scheduled.extend(reversed(reverse_items))
+        order_items = list(reversed(reverse_items))
+        _shift_order_items_to_optimization_start(order_items, config=config, mode_label="ModeA")
+        scheduled.extend(order_items)
     return scheduled
 
 
-def _modeb_forward_analysis_start(tasks: list[OperationTask], config: FortuneBjConfig | None) -> datetime:
-    configured_start = _optimization_start_period(config)
-    if configured_start is not None:
-        return configured_start
-    return min(_optimization_period_start(task, config) for task in tasks)
-
-
-def _schedule_tasks_modeb_forward_projection(
+def _schedule_tasks_modeb_backward_with_start_shift(
     tasks: list[OperationTask],
     *,
     config: FortuneBjConfig | None = None,
@@ -1066,36 +1176,40 @@ def _schedule_tasks_modeb_forward_projection(
     tasks_by_order: dict[str, list[OperationTask]] = {}
     for task in tasks:
         tasks_by_order.setdefault(task.order_id, []).append(task)
-    analysis_start = _modeb_forward_analysis_start(tasks, config)
     scheduled: list[ScheduledOperation] = []
 
-    def order_sort_key(key: str) -> tuple[int, datetime, datetime, str]:
+    def order_sort_key(key: str) -> tuple[datetime, int, datetime, datetime, str]:
         order_tasks = tasks_by_order[key]
+        first_period_start = min(_optimization_period_start(task, config) for task in order_tasks)
         priority_rank = min(task.priority_rank for task in order_tasks)
         priority_date = min(_priority_sort_date(task) for task in order_tasks)
         due_date = min(task.due_date for task in order_tasks)
-        return priority_rank, priority_date, due_date, key
+        return first_period_start, priority_rank, priority_date, due_date, key
 
     for order_id in sorted(tasks_by_order, key=order_sort_key):
-        cursor = analysis_start
         order_tasks = sorted(tasks_by_order[order_id], key=lambda task: task.activity)
-        for task in order_tasks:
+        cursor = min(task.due_date for task in order_tasks)
+        reverse_items: list[ScheduledOperation] = []
+        for task in reversed(order_tasks):
             duration_hours = OUTSOURCE_DURATION_HOURS if task.is_outsource else max(float(task.duration_hours), 0.0)
-            start = cursor
-            end = start + timedelta(hours=duration_hours)
+            start = cursor - timedelta(hours=duration_hours)
             if task.is_outsource:
-                note = "ModeB优化开始周期前推基线；外协固定7天，不占用本地资源"
+                note = "ModeB按交期倒排基线；外协固定7天，不占用本地资源"
             else:
-                note = "ModeB优化开始周期前推基线"
-            scheduled.append(ScheduledOperation(
+                note = "ModeB按交期倒排基线"
+            reverse_items.append(ScheduledOperation(
                 task=task,
                 start=start,
-                end=end,
-                on_time=end <= task.due_date,
-                tardy_hours=max((end - task.due_date).total_seconds() / 3600.0, 0.0),
+                end=cursor,
+                on_time=cursor <= task.due_date,
+                tardy_hours=max((cursor - task.due_date).total_seconds() / 3600.0, 0.0),
                 note=note,
             ))
-            cursor = end
+            cursor = start
+
+        order_items = list(reversed(reverse_items))
+        _shift_order_items_to_optimization_start(order_items, config=config, mode_label="ModeB")
+        scheduled.extend(order_items)
     return scheduled
 
 
@@ -1114,15 +1228,16 @@ def _schedule_tasks_mode_b_v2(
     start_period = _optimization_start_period(config)
     if progress is not None:
         progress(
-            f"ModeB 100%产能优化建议: 先从优化开始周期前推负荷，工序 {len(tasks):,} 条；"
+            f"ModeB 100%产能优化建议: 先按订单交期倒排负荷，工序 {len(tasks):,} 条；"
             f"优化粒度 {granularity}，优化开始周期 {_period_label_from_start(start_period, config) if start_period else '未指定'}；"
+            f"逾期订单或倒排后早于优化开始周期的订单会整单平移到优化开始周期；"
             f"在每个{granularity}内按整数产品数量分配原工作中心、可选工作中心和外包；"
             f"记录参考规模 {max_window_tasks:,} 条工序/周期，求解时间上限 "
             f"{config.mode_b_solver_max_seconds if config else 60.0} 秒"
         )
 
-    baseline = _schedule_tasks_modeb_forward_projection(tasks, config=config)
-    _mark_analysis_items(baseline, status="ModeB前推基线", source="ModeB", window_type="优化基线")
+    baseline = _schedule_tasks_modeb_backward_with_start_shift(tasks, config=config)
+    _mark_analysis_items(baseline, status="ModeB倒排平移基线", source="ModeB", window_type="优化基线")
     bottleneck_report = _build_bottleneck_report(baseline, capacities, config=config)
     bottleneck_workcenters = {
         str(row["工作中心"])
@@ -1132,7 +1247,7 @@ def _schedule_tasks_mode_b_v2(
     if result is not None:
         result.bottleneck_report = bottleneck_report
     if progress is not None:
-        progress(f"ModeB瓶颈识别: 基于优化开始周期前推负荷识别瓶颈工作中心 {len(bottleneck_workcenters)} 个")
+        progress(f"ModeB瓶颈识别: 基于交期倒排和平移后的负荷识别瓶颈工作中心 {len(bottleneck_workcenters)} 个")
 
     route_started = time.perf_counter()
     final_items, allocations, option_rows, optimization_summary, optimization_stats = _optimize_modeb_integer_allocations(
@@ -1550,6 +1665,7 @@ def _modeb_route_options(
         "work_center": task.work_center if not task.is_outsource else "外包",
         "resource_group": task.resource_group if not task.is_outsource else "外包",
         "unit_hours": 0.0 if task.is_outsource else original_unit_hours,
+        "unit_hours_source": "外包" if task.is_outsource else "原工序",
         "is_outsource": bool(task.is_outsource),
         "priority_rank": 0,
         "is_original": True,
@@ -1562,6 +1678,7 @@ def _modeb_route_options(
                 "work_center": "外包",
                 "resource_group": "外包",
                 "unit_hours": 0.0,
+                "unit_hours_source": "外包",
                 "is_outsource": True,
                 "priority_rank": option.priority_rank,
                 "is_original": False,
@@ -1588,6 +1705,7 @@ def _modeb_route_options(
                 "work_center": option.alternative_work_center,
                 "resource_group": option.alternative_resource_group,
                 "unit_hours": max(float(profile["unit_hours"]), 0.0),
+                "unit_hours_source": option.unit_hours_source,
                 "is_outsource": False,
                 "priority_rank": option.priority_rank,
                 "is_original": False,
@@ -1721,6 +1839,7 @@ def _original_allocation_for_item(
             destination_work_center=UNMAINTAINED_WORKCENTER,
             destination_resource_group=UNMAINTAINED_WORKCENTER,
             unit_hours=0.0,
+            unit_hours_source=UNMAINTAINED_WORKCENTER,
             load_hours=0.0,
             original_unit_hours=original_unit_hours,
             original_released_hours=0.0,
@@ -1743,6 +1862,7 @@ def _original_allocation_for_item(
         destination_work_center="外包" if is_outsource else item.task.work_center,
         destination_resource_group="外包" if is_outsource else item.task.resource_group,
         unit_hours=0.0 if is_outsource else original_unit_hours,
+        unit_hours_source="外包" if is_outsource else "原工序",
         load_hours=load_hours,
         original_unit_hours=original_unit_hours,
         original_released_hours=quantity * original_unit_hours if is_outsource else 0.0,
@@ -2017,6 +2137,7 @@ def _optimize_modeb_integer_allocations(
                     destination_work_center="外包" if is_outsource else str(option["work_center"]),
                     destination_resource_group="外包" if is_outsource else str(option["resource_group"]),
                     unit_hours=unit_hours,
+                    unit_hours_source=str(option.get("unit_hours_source") or ("外包" if is_outsource else "可选工序表填写")),
                     load_hours=load_hours,
                     original_unit_hours=original_unit_hours,
                     original_released_hours=float(pending["released_hours"]),
@@ -2118,6 +2239,7 @@ def _build_modeb_optional_allocation_rows(
                 "周期拆分行": f"{segment_index}/{len(segments)}",
                 "原单位工时": round(allocation.original_unit_hours, 4),
                 "建议单位工时": round(allocation.unit_hours, 4),
+                "建议单位工时来源": allocation.unit_hours_source,
                 "产能计算类型": allocation.capacity_calc_type,
                 "热处/表处类型": allocation.hot_surface_type,
                 "工艺兼容组": allocation.process_group,
@@ -2218,6 +2340,7 @@ def _build_modeb_order_allocation_rows(
                 "优化后工作中心": allocation.destination_work_center,
                 "优化后资源组分类": allocation.destination_resource_group,
                 "优化后单位工时": round(allocation.unit_hours, 4),
+                "优化后单位工时来源": allocation.unit_hours_source,
                 "产能计算类型": allocation.capacity_calc_type,
                 "热处/表处类型": allocation.hot_surface_type,
                 "工艺兼容组": allocation.process_group,
@@ -4003,7 +4126,7 @@ def _write_dashboard_sheet(
     modeb_start_label = _period_display_label(_period_label_from_start(modeb_start, config), config) if modeb_start else "未指定"
     ws.append([
         f"模式：{mode} | 运行时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
-        f"ModeB优化粒度：{granularity} | "
+        f"优化粒度：{granularity} | "
         f"优化开始周期：{modeb_start_label} | "
         f"参考{config.mode_b_max_window_tasks}条工序/周期 | "
         f"工作日历：{Path(config.calendar_path).name if config.calendar_path else '默认日历'}"
@@ -4358,9 +4481,9 @@ def _write_summary_sheet(
         ("工作日历表", str(config.calendar_path) if config.calendar_path else ""),
         ("热处/表处模式", config.hot_surface_mode),
         ("分析模式", mode),
-        ("ModeB优化粒度", _optimization_granularity(config)),
-        ("ModeB优化开始周期", modeb_start_period),
-        ("ModeB优化开始周期日期跨度", _period_date_span(modeb_start_period, config)),
+        ("优化粒度", _optimization_granularity(config)),
+        ("优化开始周期", modeb_start_period),
+        ("优化开始周期日期跨度", _period_date_span(modeb_start_period, config)),
         ("ModeB参考工序数/周期", config.mode_b_max_window_tasks),
         ("ModeB求解时间上限(秒)", config.mode_b_solver_max_seconds if config.mode_b_solver_max_seconds else "不限制"),
         ("ModeB整数分配候选决策工序数", modeb_stats.get("候选决策工序数", "")),
@@ -4955,6 +5078,17 @@ def _clean_text(value: Any) -> str:
     if pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def _is_blank_cell(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip() == ""
 
 
 def _activity_key(value: Any) -> str:

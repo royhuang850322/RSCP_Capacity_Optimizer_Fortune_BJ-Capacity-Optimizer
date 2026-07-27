@@ -699,7 +699,15 @@ class MainWindow(QMainWindow):
                 "参考工序数只写入日志和报告，不作为硬性跳过阈值。"
             )
         else:
-            self.window_task_count.setText("优化周期实际工序数：ModeA 不适用")
+            self.window_task_count.setText(
+                f"优化周期实际工序数：ModeA 按{config.mode_b_optimization_granularity}度倒排平移基线"
+            )
+            self._log(
+                "ModeA参数："
+                f"优化粒度 {config.mode_b_optimization_granularity}，"
+                f"优化开始周期 {config.mode_b_optimization_start_month.strftime('%Y-%m-%d') if config.mode_b_optimization_start_month else '未指定'}，"
+                "按交期倒排；逾期订单或倒排后早于优化开始周期的订单整单平移。"
+            )
         self._log("开始运行产能分析...")
         self.worker = SchedulerWorker(config)
         self.worker.progress.connect(self._handle_progress)

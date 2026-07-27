@@ -1,5 +1,14 @@
 # Fortune BJ Capacity Optimizer Changelog
 
+## v0.1.3 - 2026-07-27
+
+- Align ModeA and ModeB to use the same optimization start period handling for overdue or early-start order chains.
+- Keep original order due dates available for reporting while moving affected unfinished orders into the selected analysis start period.
+- Add optional-operation unit-hour inheritance: blank non-outsourced optional hours can inherit the matching production operation unit hours by material and activity.
+- Block analysis with a precheck report when a blank optional operation has no matching production operation unit hour to inherit.
+- Add unit-hour source fields to ModeB optional split and order-operation detail reports.
+- Refresh the customer usage and report-reading guide for v0.1.3.
+
 ## v0.1.2 - 2026-07-24
 
 - Split ModeB optimized allocation load across reporting weeks/months in the order-operation detail, period capacity report, workgroup heatmap, optimization overview, and capacity recommendation sheets.
