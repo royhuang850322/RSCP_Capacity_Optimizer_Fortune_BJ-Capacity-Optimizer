@@ -1,5 +1,15 @@
 # Fortune BJ Capacity Optimizer Changelog
 
+## v0.1.4 - 2026-07-29
+
+- Add optional demand forecast import from `需求预测_产能分析输入模板.xlsx`, generating weekly Sunday virtual forecast orders with `FCST-YYYYMMDD-物料号` order numbers.
+- Add forecast precheck blocking when forecast materials do not have matching historical production-operation routes.
+- Add operation transfer modes for ModeA and ModeB: full-batch, half-batch, single-piece flow, and due-date-forced load.
+- Switch optimization start handling to exact start date and keep weekly/monthly reports aligned to the selected analysis granularity.
+- Add forecast source fields and period split fields to order-operation detail reports.
+- Move the forecast import toggle into the main parameter panel and disable mouse-wheel value changes on parameter controls.
+- Update heatmap colors: 0-100% uses dark-to-light green, and loads above 100% use light-to-dark red.
+
 ## v0.1.3 - 2026-07-27
 
 - Align ModeA and ModeB to use the same optimization start period handling for overdue or early-start order chains.

@@ -5,7 +5,7 @@ import json
 import re
 import sys
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 from app.fortune_bj import (
@@ -18,6 +18,7 @@ from app.fortune_bj import (
     WC_TEMPLATE_NAME,
     OPTIONAL_OPS_TEMPLATE_NAME,
     CALENDAR_TEMPLATE_NAME,
+    FORECAST_TEMPLATE_NAME,
     FortuneBjConfig,
     run_fortune_bj_schedule,
 )
@@ -62,6 +63,28 @@ except ModuleNotFoundError:  # pragma: no cover
         return None
 else:
     PYSIDE6_AVAILABLE = True
+
+
+if PYSIDE6_AVAILABLE:
+
+    class NoWheelComboBox(QComboBox):
+        def wheelEvent(self, event) -> None:  # pragma: no cover - UI event behavior
+            event.ignore()
+
+
+    class NoWheelDateEdit(QDateEdit):
+        def wheelEvent(self, event) -> None:  # pragma: no cover - UI event behavior
+            event.ignore()
+
+
+    class NoWheelSpinBox(QSpinBox):
+        def wheelEvent(self, event) -> None:  # pragma: no cover - UI event behavior
+            event.ignore()
+
+else:  # pragma: no cover
+    NoWheelComboBox = object  # type: ignore[assignment]
+    NoWheelDateEdit = object  # type: ignore[assignment]
+    NoWheelSpinBox = object  # type: ignore[assignment]
 
 
 APP_TITLE = f"Fortune BJ 产能分析工具 v{APP_VERSION}"
@@ -334,9 +357,9 @@ class MainWindow(QMainWindow):
         left.addWidget(self.header_subtitle)
         right = QHBoxLayout()
         right.setAlignment(Qt.AlignRight | Qt.AlignTop)
-        self.theme_combo = QComboBox()
+        self.theme_combo = NoWheelComboBox()
         self.theme_combo.addItems(["跟随系统", "浅色", "深色"])
-        self.language_combo = QComboBox()
+        self.language_combo = NoWheelComboBox()
         self.language_combo.addItems(["中文"])
         self.help_button = QPushButton("帮助")
         right.addWidget(QLabel("主题"))
@@ -380,25 +403,30 @@ class MainWindow(QMainWindow):
     def _build_sidebar_option_card(self) -> QWidget:
         card = CardFrame("产能分析设置")
         form = QFormLayout()
-        self.schedule_mode = QComboBox()
+        self.schedule_mode = NoWheelComboBox()
         self.schedule_mode.addItems(["ModeA：无限产能分析", "ModeB：100%产能优化建议"])
-        self.mode_b_optimization_granularity = QComboBox()
+        self.mode_b_optimization_granularity = NoWheelComboBox()
         self.mode_b_optimization_granularity.addItems(["周", "月"])
-        self.mode_b_optimization_start_month = QDateEdit()
+        self.operation_flow_mode = NoWheelComboBox()
+        self.operation_flow_mode.addItems(["整批流转", "半批流转", "单件流转", "交期强制"])
+        self.mode_b_optimization_start_month = NoWheelDateEdit()
         self.mode_b_optimization_start_month.setCalendarPopup(True)
         self.mode_b_optimization_start_month.setMinimumWidth(120)
         self._set_optimization_start_period_to_current()
         self.mode_b_max_window_tasks = self._number_spinbox(2000, minimum=1, maximum=200000, suffix=" 条")
         self.mode_b_solver_max_seconds = self._number_spinbox(60, minimum=1, maximum=3600, suffix=" 秒")
-        self.hot_surface_mode = QComboBox()
+        self.hot_surface_mode = NoWheelComboBox()
         self.hot_surface_mode.addItems(["同机加逻辑", "热处/表处专用逻辑"])
-        self.objective_profile = QComboBox()
+        self.objective_profile = NoWheelComboBox()
         self.objective_profile.addItems(["默认：产能缺口最小", "紧急类型优先（可选）", "产能均衡（待开发）", "减少资源空闲/换线（待开发）"])
+        self.enable_forecast = QCheckBox("需求预测导入")
         self.enable_urgent = QCheckBox("启用紧急类型优先级")
         self.enable_urgent.setChecked(True)
         form.addRow("计算模式", self.schedule_mode)
         form.addRow("优化粒度", self.mode_b_optimization_granularity)
-        form.addRow("优化开始周期", self.mode_b_optimization_start_month)
+        form.addRow("工序流转逻辑", self.operation_flow_mode)
+        form.addRow("优化开始日期", self.mode_b_optimization_start_month)
+        form.addRow("", self.enable_forecast)
         form.addRow("周期参考工序数", self.mode_b_max_window_tasks)
         form.addRow("OR-Tools求解上限", self.mode_b_solver_max_seconds)
         form.addRow("热处/表处", self.hot_surface_mode)
@@ -471,11 +499,13 @@ class MainWindow(QMainWindow):
         self.wc_path = self._path_edit(DATA_DIR / WC_TEMPLATE_NAME)
         self.optional_ops_path = self._path_edit(DATA_DIR / OPTIONAL_OPS_TEMPLATE_NAME)
         self.calendar_path = self._path_edit(DATA_DIR / CALENDAR_TEMPLATE_NAME)
+        self.forecast_path = self._path_edit(DATA_DIR / FORECAST_TEMPLATE_NAME)
         form.addRow("生产订单工序表", self._browse_row(self.ops_path, file_mode=True))
         form.addRow("订单交期数量表", self._browse_row(self.demand_path, file_mode=True))
         form.addRow("工作中心表", self._browse_row(self.wc_path, file_mode=True))
         form.addRow("可选工序表", self._browse_row(self.optional_ops_path, file_mode=True))
         form.addRow("工作日历表", self._browse_row(self.calendar_path, file_mode=True))
+        form.addRow("物料需求预测表", self._browse_row(self.forecast_path, file_mode=True))
         files.body_layout.addLayout(form)
         layout.addWidget(files)
 
@@ -559,12 +589,8 @@ class MainWindow(QMainWindow):
 
     def _set_optimization_start_period_to_current(self) -> None:
         today = QDate.currentDate()
-        if self.mode_b_optimization_granularity.currentText() == "月":
-            start_date = QDate(today.year(), today.month(), 1)
-            display_format = "yyyy-MM"
-        else:
-            start_date = today.addDays(-(today.dayOfWeek() - 1))
-            display_format = "yyyy-MM-dd"
+        start_date = QDate(today.year(), today.month(), today.day())
+        display_format = "yyyy-MM-dd"
         if hasattr(self, "mode_b_optimization_start_month"):
             self.mode_b_optimization_start_month.blockSignals(True)
             self.mode_b_optimization_start_month.setDisplayFormat(display_format)
@@ -578,23 +604,19 @@ class MainWindow(QMainWindow):
         if not self.optimization_start_month_manual:
             self._set_optimization_start_period_to_current()
             return
-        display_format = "yyyy-MM" if self.mode_b_optimization_granularity.currentText() == "月" else "yyyy-MM-dd"
-        self.mode_b_optimization_start_month.setDisplayFormat(display_format)
+        self.mode_b_optimization_start_month.setDisplayFormat("yyyy-MM-dd")
 
     def _selected_optimization_start_month(self) -> datetime:
         if not self.optimization_start_month_manual:
             self._set_optimization_start_period_to_current()
         value = self.mode_b_optimization_start_month.date()
-        selected = datetime(value.year(), value.month(), value.day())
-        if self.mode_b_optimization_granularity.currentText() == "月":
-            return datetime(selected.year, selected.month, 1)
-        return selected - timedelta(days=selected.weekday())
+        return datetime(value.year(), value.month(), value.day())
 
     def _days_spinbox(self, value: int, *, minimum: int) -> QSpinBox:
         return self._number_spinbox(value, minimum=minimum, maximum=3650, suffix=" 天")
 
     def _number_spinbox(self, value: int, *, minimum: int, maximum: int, suffix: str) -> QSpinBox:
-        spin = QSpinBox()
+        spin = NoWheelSpinBox()
         spin.setRange(minimum, maximum)
         spin.setValue(value)
         spin.setSuffix(suffix)
@@ -667,12 +689,19 @@ class MainWindow(QMainWindow):
             self.nav.setCurrentRow(2)
             self._finish_run_log("FAILED", error)
             return
+        forecast_text = self.forecast_path.text().strip()
+        if self.enable_forecast.isChecked() and not forecast_text:
+            message = "已勾选需求预测导入，但物料需求预测表路径为空。请先选择需求预测_产能分析输入模板.xlsx。"
+            self._show_error("需求预测输入缺失", message)
+            self._finish_run_log("FAILED", message)
+            return
         config = FortuneBjConfig(
             operations_path=Path(self.ops_path.text()),
             demand_path=Path(self.demand_path.text()),
             workcenter_path=Path(self.wc_path.text()),
             optional_operations_path=Path(self.optional_ops_path.text()),
             calendar_path=Path(self.calendar_path.text()),
+            forecast_path=Path(forecast_text) if forecast_text else None,
             output_dir=Path(self.out_dir.text()),
             schedule_mode="ModeB" if self.schedule_mode.currentText().startswith("ModeB") else "ModeA",
             mode_b_optimization_granularity=self.mode_b_optimization_granularity.currentText(),
@@ -680,6 +709,8 @@ class MainWindow(QMainWindow):
             mode_b_max_window_tasks=self.mode_b_max_window_tasks.value(),
             mode_b_solver_max_seconds=float(self.mode_b_solver_max_seconds.value()),
             enable_urgent=self.enable_urgent.isChecked(),
+            enable_forecast=self.enable_forecast.isChecked(),
+            operation_flow_mode=self.operation_flow_mode.currentText(),
             hot_surface_mode=self.hot_surface_mode.currentText(),
             objective_profile=self.objective_profile.currentText(),
         )
@@ -692,7 +723,9 @@ class MainWindow(QMainWindow):
             self._log(
                 "ModeB参数："
                 f"优化粒度 {config.mode_b_optimization_granularity}，"
-                f"优化开始周期 {config.mode_b_optimization_start_month.strftime('%Y-%m-%d') if config.mode_b_optimization_start_month else '未指定'}，"
+                f"工序流转 {config.operation_flow_mode}，"
+                f"优化开始日期 {config.mode_b_optimization_start_month.strftime('%Y-%m-%d') if config.mode_b_optimization_start_month else '未指定'}，"
+                f"需求预测 {'启用' if config.enable_forecast else '未启用'}，"
                 f"按{config.mode_b_optimization_granularity}覆盖全部数据，"
                 f"参考工序数 {config.mode_b_max_window_tasks:,} 条，"
                 f"OR-Tools求解上限 {config.mode_b_solver_max_seconds:g} 秒；"
@@ -705,8 +738,10 @@ class MainWindow(QMainWindow):
             self._log(
                 "ModeA参数："
                 f"优化粒度 {config.mode_b_optimization_granularity}，"
-                f"优化开始周期 {config.mode_b_optimization_start_month.strftime('%Y-%m-%d') if config.mode_b_optimization_start_month else '未指定'}，"
-                "按交期倒排；逾期订单或倒排后早于优化开始周期的订单整单平移。"
+                f"工序流转 {config.operation_flow_mode}，"
+                f"优化开始日期 {config.mode_b_optimization_start_month.strftime('%Y-%m-%d') if config.mode_b_optimization_start_month else '未指定'}，"
+                f"需求预测 {'启用' if config.enable_forecast else '未启用'}，"
+                "按交期倒排；逾期订单或倒排后早于优化开始日期的订单整单平移。"
             )
         self._log("开始运行产能分析...")
         self.worker = SchedulerWorker(config)

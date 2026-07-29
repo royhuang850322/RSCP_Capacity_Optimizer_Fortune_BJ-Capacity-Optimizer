@@ -48,11 +48,12 @@ DEPLOY_ROOT = _resolve_deploy_root()
 DATA_DIR = DEPLOY_ROOT / "数据导入"
 REPORT_DIR = DEPLOY_ROOT / "报告"
 
-OPS_TEMPLATE_NAME = "生产订单工序_排产输入模板.csv"
+OPS_TEMPLATE_NAME = "生产订单工序_产能分析输入模板.csv"
 DEMAND_TEMPLATE_NAME = "订单交期数量_产能分析输入模板.xlsx"
-WC_TEMPLATE_NAME = "工作中心_排产输入模板.xlsx"
-OPTIONAL_OPS_TEMPLATE_NAME = "可选工序_排产输入模板.xlsx"
-CALENDAR_TEMPLATE_NAME = "工作日历_排产输入模板.xlsx"
+WC_TEMPLATE_NAME = "工作中心_产能分析输入模板.xlsx"
+OPTIONAL_OPS_TEMPLATE_NAME = "可选工序_产能分析输入模板.xlsx"
+CALENDAR_TEMPLATE_NAME = "工作日历_产能分析输入模板.xlsx"
+FORECAST_TEMPLATE_NAME = "需求预测_产能分析输入模板.xlsx"
 
 PLACEHOLDER_DUE_YEAR = 2049
 OUTSOURCE_DURATION_HOURS = 7 * 24
@@ -77,6 +78,7 @@ class FortuneBjConfig:
     workcenter_path: Path
     optional_operations_path: Path | None = None
     calendar_path: Path | None = None
+    forecast_path: Path | None = None
     output_dir: Path = REPORT_DIR
     schedule_mode: str = "ModeA"
     mode_b_optimize_days: int = 1
@@ -85,6 +87,8 @@ class FortuneBjConfig:
     mode_b_max_window_tasks: int = 2000
     mode_b_solver_max_seconds: float | None = 60.0
     enable_urgent: bool = True
+    enable_forecast: bool = False
+    operation_flow_mode: str = "整批流转"
     hot_surface_mode: str = "同机加逻辑"
     objective_profile: str = "默认：产能缺口最小"
     start_time: datetime | None = None
@@ -162,6 +166,11 @@ class OperationTask:
     priority_rank: int = PRIORITY_NORMAL
     priority_type: str = "普通订单"
     priority_reason: str = "普通订单"
+    demand_source: str = "真实订单"
+    forecast_month: str = ""
+    forecast_week_end: str = ""
+    forecast_drawing: str = ""
+    route_source_order: str = ""
     is_outsource: bool = False
     missing_work_center: bool = False
     is_hot_surface: bool = False
@@ -277,9 +286,14 @@ def _validate_analysis_inputs(
     normalized_orders: list[str | None] = [_normalize_order(value) for value in operation_df["订单"]]
     operation_orders = {order for order in normalized_orders if order}
     demand_orders = set(demand_by_order)
+    forecast_orders = {
+        order_id
+        for order_id, demand in demand_by_order.items()
+        if str(demand.get("需求来源") or "") == "预测需求"
+    }
 
     missing_order_rows: list[dict[str, Any]] = []
-    for order_id in sorted(demand_orders - operation_orders):
+    for order_id in sorted((demand_orders - forecast_orders) - operation_orders):
         demand = demand_by_order.get(order_id, {})
         due_date = demand.get("交期")
         original_due = demand.get("原始最早交期")
@@ -499,8 +513,17 @@ def run_fortune_bj_schedule(config: FortuneBjConfig, progress: ProgressCallback 
     notify("读取订单交期数量...")
     demand_by_order, demand_issues, placeholder_due_orders = load_order_demand(config.demand_path, config)
     notify(f"已读取有效订单需求 {len(demand_by_order)} 个，问题/调整 {len(demand_issues)} 条。")
+    forecast_issues: list[dict[str, Any]] = []
+    if config.enable_forecast:
+        notify("读取需求预测...")
+        forecast_demand_by_order, forecast_issues = load_forecast_demand(config)
+        demand_by_order.update(forecast_demand_by_order)
+        notify(f"已生成预测虚拟订单 {len(forecast_demand_by_order)} 个，问题 {len(forecast_issues)} 条。")
+    else:
+        notify("需求预测导入未启用，已忽略需求预测表。")
     blocking_demand_issue_rows = _blocking_demand_issues(demand_issues)
     blocking_optional_issue_rows = _blocking_optional_issues(optional_issues)
+    blocking_forecast_issue_rows = _blocking_forecast_issues(forecast_issues)
     if placeholder_due_orders:
         placeholder_order_count = len({row["订单"] for row in placeholder_due_orders})
         notify(
@@ -529,6 +552,14 @@ def run_fortune_bj_schedule(config: FortuneBjConfig, progress: ProgressCallback 
             "说明": "可选工序存在阻断问题，正式产能分析已停止。",
         })
         blocking_issue_rows = [*blocking_optional_issue_rows, *blocking_issue_rows]
+    if blocking_forecast_issue_rows:
+        precheck_summary.insert(0, {
+            "校验项": "需求预测输入文件",
+            "状态": "失败",
+            "问题数": len(blocking_forecast_issue_rows),
+            "说明": "需求预测输入文件存在阻断问题，正式产能分析已停止。",
+        })
+        blocking_issue_rows = [*blocking_forecast_issue_rows, *blocking_issue_rows]
     precheck_failed = any(row.get("状态") == "失败" for row in precheck_summary)
     if precheck_failed or missing_order_rows or blocking_issue_rows:
         precheck_report = _write_precheck_report(
@@ -569,6 +600,7 @@ def run_fortune_bj_schedule(config: FortuneBjConfig, progress: ProgressCallback 
     result.data_issues.extend(capacity_issues)
     result.data_issues.extend(optional_issues)
     result.data_issues.extend(demand_issues)
+    result.data_issues.extend(forecast_issues)
     result.data_issues.extend(task_issues)
     result.missing_mapping.extend(missing_mapping)
     result.placeholder_due_orders.extend(placeholder_due_orders)
@@ -865,18 +897,19 @@ def load_order_demand(path: Path, config: FortuneBjConfig) -> tuple[dict[str, di
             overdue = True
             adjusted_to_start_period = True
             issues.append({
-                "类型": "过期订单转入优化开始周期",
+                "类型": "过期订单转入优化开始日期",
                 "文件": str(path),
                 "行号": idx + 2,
                 "订单": order_id,
                 "原交期": original_due_date.strftime("%Y-%m-%d"),
                 "优化粒度": _optimization_granularity(config),
-                "优化开始周期": _period_label_from_start(optimization_start, config),
-                "优化开始周期日期跨度": _period_span_from_bounds(
+                "优化开始日期": optimization_start.strftime("%Y-%m-%d"),
+                "优化开始日期所在周期": _period_label_from_start(optimization_start, config),
+                "优化开始日期所在周期跨度": _period_span_from_bounds(
                     optimization_start,
                     _optimization_period_end(optimization_start, config),
                 ),
-                "说明": "原交期早于优化开始周期；工具仍按原交期倒排，之后将整单工序链平移到优化开始周期起算，并按过期订单优先级处理",
+                "说明": "原交期早于优化开始日期；工具仍按原交期倒排，之后将整单工序链平移到优化开始日期起算，并按过期订单优先级处理",
             })
         priority_rank, priority_type, priority_reason = _priority_from_flags(urgent_type, overdue)
         existing = demand.get(order_id)
@@ -894,6 +927,7 @@ def load_order_demand(path: Path, config: FortuneBjConfig) -> tuple[dict[str, di
                 "订单优先级": priority_rank,
                 "优先级类型": priority_type,
                 "优先级原因": priority_reason,
+                "需求来源": "真实订单",
             }
             continue
         existing["数量"] += quantity
@@ -913,6 +947,260 @@ def load_order_demand(path: Path, config: FortuneBjConfig) -> tuple[dict[str, di
         existing["优先级类型"] = priority_type
         existing["优先级原因"] = priority_reason
     return demand, issues, placeholder_due_orders
+
+
+def load_forecast_demand(config: FortuneBjConfig) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    if not config.enable_forecast:
+        return {}, []
+    path = config.forecast_path
+    if path is None or not str(path).strip() or str(path).strip() == ".":
+        return {}, [{
+            "类型": "需求预测文件缺失",
+            "文件": "",
+            "说明": "已勾选需求预测导入，但未填写物料需求预测表路径。",
+        }]
+    path = Path(path)
+    if not path.exists():
+        return {}, [{
+            "类型": "需求预测文件缺失",
+            "文件": str(path),
+            "说明": "已勾选需求预测导入，但物料需求预测表文件不存在。",
+        }]
+
+    try:
+        df = _read_workbook_sheet(path, "清单")
+    except ValueError as exc:
+        return {}, [{
+            "类型": "需求预测清单缺失",
+            "文件": str(path),
+            "说明": str(exc),
+        }]
+
+    required = ["物料编码"]
+    issues = _missing_columns_issue(df, required, path)
+    if issues:
+        return {}, issues
+
+    operations_df = _read_workbook_first_sheet(config.operations_path)
+    route_templates = _select_route_templates_by_material(operations_df)
+    material_col = "物料编码"
+    drawing_col = "图号" if "图号" in df.columns else ""
+    month_columns: list[tuple[Any, int, int]] = []
+    for column in list(df.columns)[2:]:
+        month = _parse_forecast_month_header(column)
+        if month is None:
+            if df[column].map(lambda value: bool(_clean_text(value))).any():
+                issues.append({
+                    "类型": "需求预测月份列异常",
+                    "文件": str(path),
+                    "列名": str(column),
+                    "说明": "预测月份列必须使用 YYYYMM、YYYY-M 或可识别的月份日期格式。",
+                })
+            continue
+        month_columns.append((column, month[0], month[1]))
+
+    if not month_columns:
+        issues.append({
+            "类型": "需求预测月份列异常",
+            "文件": str(path),
+            "说明": "清单中没有找到可识别的月份预测列。",
+        })
+
+    demand: dict[str, dict[str, Any]] = {}
+    missing_route_materials: set[str] = set()
+    optimization_start = _optimization_start_period(config)
+    for idx, row in df.iterrows():
+        material = _clean_text(row.get(material_col))
+        if not material:
+            continue
+        drawing = _clean_text(row.get(drawing_col)) if drawing_col else ""
+        route_template = route_templates.get(material)
+        route_source_order = str(route_template.get("source_order") or "") if route_template else ""
+        has_positive_forecast = False
+        for column, year, month in month_columns:
+            raw_value = row.get(column)
+            if _is_blank_cell(raw_value):
+                continue
+            quantity_value = _to_number(raw_value, default=0.0)
+            if quantity_value < 0:
+                issues.append({
+                    "类型": "需求预测数量异常",
+                    "文件": str(path),
+                    "行号": idx + 2,
+                    "物料": material,
+                    "预测月份": f"{year:04d}-{month:02d}",
+                    "当前值": raw_value,
+                    "说明": "预测数量不能小于0。",
+                })
+                continue
+            if quantity_value <= 0:
+                continue
+            has_positive_forecast = True
+            quantity_int = int(round(quantity_value))
+            if abs(quantity_value - quantity_int) > 1e-6:
+                issues.append({
+                    "类型": "需求预测数量异常",
+                    "文件": str(path),
+                    "行号": idx + 2,
+                    "物料": material,
+                    "预测月份": f"{year:04d}-{month:02d}",
+                    "当前值": raw_value,
+                    "说明": "预测数量必须是整数件数。",
+                })
+                continue
+            if route_template is None:
+                continue
+            for due_date, weekly_quantity in _split_monthly_forecast_to_sundays(year, month, quantity_int):
+                order_id = f"FCST-{due_date.strftime('%Y%m%d')}-{material}"
+                original_due_date = due_date
+                overdue = bool(optimization_start is not None and due_date < optimization_start)
+                priority_rank, priority_type, priority_reason = _priority_from_flags("", overdue)
+                existing = demand.get(order_id)
+                if existing is None:
+                    demand[order_id] = {
+                        "订单": order_id,
+                        "数量": float(weekly_quantity),
+                        "交期": due_date,
+                        "紧急": False,
+                        "手动紧急": False,
+                        "紧急类型": "",
+                        "过期": overdue,
+                        "原始最早交期": original_due_date,
+                        "已转入优化开始周期": overdue,
+                        "订单优先级": priority_rank,
+                        "优先级类型": priority_type,
+                        "优先级原因": priority_reason,
+                        "需求来源": "预测需求",
+                        "预测月份": f"{year:04d}-{month:02d}",
+                        "预测周日": due_date.strftime("%Y-%m-%d"),
+                        "预测物料": material,
+                        "预测图号": drawing,
+                        "路线来源订单": route_source_order,
+                    }
+                    continue
+                existing["数量"] = float(existing.get("数量") or 0.0) + float(weekly_quantity)
+        if route_template is None and has_positive_forecast and material not in missing_route_materials:
+            missing_route_materials.add(material)
+            issues.append({
+                "类型": "预测物料缺少工艺路线",
+                "文件": str(path),
+                "行号": idx + 2,
+                "物料": material,
+                "图号": drawing,
+                "说明": "该预测物料在生产订单工序文件中找不到同物料历史工艺路线，正式产能分析已停止。",
+            })
+    return demand, issues
+
+
+def _blocking_forecast_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    blocking_types = {
+        "缺少字段",
+        "需求预测文件缺失",
+        "需求预测清单缺失",
+        "需求预测月份列异常",
+        "需求预测数量异常",
+        "预测物料缺少工艺路线",
+    }
+    return [row for row in issues if str(row.get("类型") or "") in blocking_types]
+
+
+def _read_workbook_sheet(path: Path, sheet_name: str) -> pd.DataFrame:
+    if path.suffix.lower() == ".csv":
+        return _read_workbook_first_sheet(path)
+    try:
+        return pd.read_excel(path, sheet_name=sheet_name)
+    except ValueError as exc:
+        raise ValueError(f"{Path(path).name} 缺少名为“{sheet_name}”的sheet。") from exc
+
+
+def _parse_forecast_month_header(value: Any) -> tuple[int, int] | None:
+    if isinstance(value, datetime):
+        return value.year, value.month
+    text = _clean_text(value)
+    if not text:
+        return None
+    if re.fullmatch(r"\d{6}", text):
+        year = int(text[:4])
+        month = int(text[4:6])
+    else:
+        match = re.search(r"(\d{4})\D?(\d{1,2})", text)
+        if not match:
+            return None
+        year = int(match.group(1))
+        month = int(match.group(2))
+    if 1 <= month <= 12:
+        return year, month
+    return None
+
+
+def _split_monthly_forecast_to_sundays(year: int, month: int, quantity: int) -> list[tuple[datetime, int]]:
+    if quantity <= 0:
+        return []
+    _, days_in_month = calendar.monthrange(year, month)
+    sundays = [
+        datetime(year, month, day)
+        for day in range(1, days_in_month + 1)
+        if datetime(year, month, day).weekday() == 6
+    ]
+    if not sundays:
+        return [(datetime(year, month, days_in_month), quantity)]
+    base = quantity // len(sundays)
+    remainder = quantity % len(sundays)
+    rows: list[tuple[datetime, int]] = []
+    for index, due_date in enumerate(sundays):
+        weekly_quantity = base + (remainder if index == len(sundays) - 1 else 0)
+        if weekly_quantity > 0:
+            rows.append((due_date, weekly_quantity))
+    return rows
+
+
+def _select_route_templates_by_material(operation_df: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    required = {"订单", "活动", "物料", "工序短文本", "标准值1", "标准值2", "标准值3"}
+    if not required.issubset(set(operation_df.columns)):
+        return {}
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for idx, row in operation_df.iterrows():
+        material = _clean_text(row.get("物料"))
+        order_id = _normalize_order(row.get("订单"))
+        if not material or not order_id:
+            continue
+        key = (material, order_id)
+        item = grouped.setdefault(key, {
+            "material": material,
+            "source_order": order_id,
+            "rows": [],
+            "activities": set(),
+            "total_unit_hours": 0.0,
+            "first_row": idx + 2,
+        })
+        item["rows"].append((idx, row))
+        item["activities"].add(_activity_key(row.get("活动")))
+        item["total_unit_hours"] += sum(_to_number(row.get(col), default=0.0) for col in ("标准值1", "标准值2", "标准值3"))
+        item["first_row"] = min(int(item["first_row"]), idx + 2)
+
+    selected: dict[str, dict[str, Any]] = {}
+    for route in grouped.values():
+        material = str(route["material"])
+        current = selected.get(material)
+        route_key = (
+            len(route["activities"]),
+            len(route["rows"]),
+            float(route["total_unit_hours"]),
+            -int(route["first_row"]),
+            str(route["source_order"]),
+        )
+        current_key = (
+            len(current["activities"]),
+            len(current["rows"]),
+            float(current["total_unit_hours"]),
+            -int(current["first_row"]),
+            str(current["source_order"]),
+        ) if current else None
+        if current is None or route_key > current_key:
+            selected[material] = route
+    for route in selected.values():
+        route["rows"] = sorted(route["rows"], key=lambda item: (_to_number(item[1].get("活动"), default=0.0), item[0]))
+    return selected
 
 
 def _optimization_start_month(config: FortuneBjConfig) -> datetime | None:
@@ -935,9 +1223,7 @@ def _optimization_start_period(config: FortuneBjConfig | None) -> datetime | Non
     value = config.mode_b_optimization_start_month
     if value is None:
         return None
-    if _optimization_granularity(config) == "月":
-        return datetime(value.year, value.month, 1)
-    return _week_start(value)
+    return _day_start(value)
 
 
 def load_operation_tasks(
@@ -1016,6 +1302,11 @@ def load_operation_tasks(
             priority_rank=int(demand.get("订单优先级") or PRIORITY_NORMAL),
             priority_type=str(demand.get("优先级类型") or "普通订单"),
             priority_reason=str(demand.get("优先级原因") or "普通订单"),
+            demand_source=str(demand.get("需求来源") or "真实订单"),
+            forecast_month=str(demand.get("预测月份") or ""),
+            forecast_week_end=str(demand.get("预测周日") or ""),
+            forecast_drawing=str(demand.get("预测图号") or ""),
+            route_source_order=str(demand.get("路线来源订单") or ""),
             is_outsource=is_outsource,
             missing_work_center=missing_work_center,
             is_hot_surface=is_hot_surface,
@@ -1038,6 +1329,15 @@ def load_operation_tasks(
                 started_at,
                 f"可分析 {len(tasks):,}，缺失映射 {len(missing_mapping):,}",
             )
+    forecast_tasks, forecast_missing_mapping, forecast_task_issues = _build_forecast_operation_tasks(
+        operation_df=df,
+        capacities=capacities,
+        demand_by_order=demand_by_order,
+        config=config,
+    )
+    tasks.extend(forecast_tasks)
+    missing_mapping.extend(forecast_missing_mapping)
+    issues.extend(forecast_task_issues)
     tasks.sort(key=lambda task: (task.order_id, task.activity, task.source_row or 0))
     _emit_progress(
         progress,
@@ -1048,6 +1348,116 @@ def load_operation_tasks(
         f"完成：可分析 {len(tasks):,}，缺失映射 {len(missing_mapping):,}",
     )
     return tasks, issues, missing_mapping
+
+
+def _build_forecast_operation_tasks(
+    *,
+    operation_df: pd.DataFrame,
+    capacities: dict[str, WorkCenterCapacity],
+    demand_by_order: dict[str, dict[str, Any]],
+    config: FortuneBjConfig | None,
+) -> tuple[list[OperationTask], list[dict[str, Any]], list[dict[str, Any]]]:
+    forecast_demands = {
+        order_id: demand
+        for order_id, demand in demand_by_order.items()
+        if str(demand.get("需求来源") or "") == "预测需求"
+    }
+    if not forecast_demands:
+        return [], [], []
+
+    route_templates = _select_route_templates_by_material(operation_df)
+    tasks: list[OperationTask] = []
+    missing_mapping: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+    for order_id, demand in sorted(forecast_demands.items()):
+        material = _clean_text(demand.get("预测物料")) or _forecast_material_from_order_id(order_id)
+        route = route_templates.get(material)
+        if route is None:
+            issues.append({
+                "类型": "预测物料缺少工艺路线",
+                "订单": order_id,
+                "物料": material,
+                "说明": "该预测虚拟订单未找到同物料历史工艺路线，已跳过工序生成。",
+            })
+            continue
+        for idx, row in route["rows"]:
+            activity = _to_number(row.get("活动"), default=0.0)
+            process_text = _clean_text(row.get("工序短文本"))
+            route_material = _clean_text(row.get("物料")) or material
+            unit_hours = sum(_to_number(row.get(col), default=0.0) for col in ("标准值1", "标准值2", "标准值3"))
+            is_outsource = "外协" in process_text
+            capacity = capacities.get(process_text)
+            is_hot_surface = _is_hot_surface(process_text)
+            capacity_calc_type = _clean_text(row.get("工艺处理类型")) or (capacity.capacity_calc_type if capacity else "")
+            hot_surface_type = _hot_surface_type_from_text(row.get("热处表处类型"), process_text, capacity.hot_surface_type if capacity else "")
+            process_group = _clean_text(row.get("工艺兼容组")) or (capacity.process_groups if capacity else "") or process_text
+            unit_capacity = _positive_or_default(
+                _to_number(row.get("单件容量占用"), default=0.0),
+                capacity.default_unit_capacity if capacity else 1.0,
+            )
+            quantity = float(demand.get("数量") or 0.0)
+            duration = _operation_load_hours(
+                quantity=quantity,
+                unit_hours=unit_hours,
+                capacity=capacity,
+                is_hot_surface=is_hot_surface,
+                capacity_calc_type=capacity_calc_type,
+                unit_capacity=unit_capacity,
+                config=config,
+            )
+            missing_work_center = bool(capacity is None and not is_outsource)
+            if missing_work_center:
+                missing_mapping.append({
+                    "订单": order_id,
+                    "活动": activity,
+                    "物料": route_material,
+                    "工序短文本": process_text,
+                    "源文件行号": idx + 2,
+                    "处理建议": "预测需求采用历史工艺路线；请在工作中心模板中补充该工序短文本对应的工作中心、资源组分类、设备数量和日历名称。",
+                })
+            tasks.append(OperationTask(
+                order_id=order_id,
+                activity=activity,
+                material=route_material,
+                process_text=process_text,
+                work_center=capacity.work_center if capacity else (UNMAINTAINED_WORKCENTER if missing_work_center else "外协"),
+                resource_group=capacity.resource_group if capacity else (UNMAINTAINED_WORKCENTER if missing_work_center else "外协"),
+                quantity=quantity,
+                unit_hours=unit_hours,
+                duration_hours=duration,
+                due_date=demand["交期"],
+                urgent=bool(demand.get("紧急")),
+                manual_urgent=bool(demand.get("手动紧急")),
+                urgent_type=str(demand.get("紧急类型") or ""),
+                overdue=bool(demand.get("过期")),
+                adjusted_to_start_period=bool(demand.get("已转入优化开始周期")),
+                original_due_date=demand.get("原始最早交期") if isinstance(demand.get("原始最早交期"), datetime) else demand["交期"],
+                priority_rank=int(demand.get("订单优先级") or PRIORITY_NORMAL),
+                priority_type=str(demand.get("优先级类型") or "普通订单"),
+                priority_reason=str(demand.get("优先级原因") or "普通订单"),
+                demand_source="预测需求",
+                forecast_month=str(demand.get("预测月份") or ""),
+                forecast_week_end=str(demand.get("预测周日") or ""),
+                forecast_drawing=str(demand.get("预测图号") or ""),
+                route_source_order=str(route.get("source_order") or demand.get("路线来源订单") or ""),
+                is_outsource=is_outsource,
+                missing_work_center=missing_work_center,
+                is_hot_surface=is_hot_surface,
+                source_row=idx + 2,
+                capacity_calc_type=capacity_calc_type,
+                hot_surface_type=hot_surface_type,
+                process_group=process_group,
+                unit_capacity=unit_capacity,
+                allow_batch_mix=_to_bool(row.get("是否允许合炉")) if "是否允许合炉" in operation_df.columns else True,
+                must_same_batch=_to_bool(row.get("是否必须整单同批")),
+                treatment_program=_clean_text(row.get("热处/表处程序")),
+            ))
+    return tasks, missing_mapping, issues
+
+
+def _forecast_material_from_order_id(order_id: str) -> str:
+    parts = str(order_id or "").split("-", 2)
+    return parts[2] if len(parts) == 3 else ""
 
 
 def _schedule_tasks(
@@ -1077,8 +1487,8 @@ def _schedule_tasks(
         progress(
             f"ModeA无限产能倒排: {len(tasks):,} 条工序；"
             f"优化粒度 {_optimization_granularity(config)}，"
-            f"优化开始周期 {_period_label_from_start(start_period, config) if start_period else '未指定'}；"
-            f"逾期订单或倒排后早于优化开始周期的订单会整单平移到优化开始周期"
+            f"优化开始日期 {start_period.strftime('%Y-%m-%d') if start_period else '未指定'}；"
+            f"逾期订单或倒排后早于优化开始日期的订单会整单平移到优化开始日期"
         )
     scheduled = _schedule_tasks_infinite_capacity(tasks, config=config)
     _mark_analysis_items(scheduled, status="ModeA倒排平移基线", source="ModeA", window_type="全量分析")
@@ -1117,9 +1527,120 @@ def _shift_order_items_to_optimization_start(
         item.on_time = item.end <= item.task.due_date
         item.tardy_hours = max((item.end - item.task.due_date).total_seconds() / 3600.0, 0.0)
         if item.task.is_outsource:
-            item.note = f"{mode_label}按交期倒排后整单平移至优化开始周期；外协固定7天，不占用本地资源"
+            item.note = f"{mode_label}按交期倒排后整单平移至优化开始日期；外协固定7天，不占用本地资源"
         else:
-            item.note = f"{mode_label}按交期倒排后整单平移至优化开始周期"
+            item.note = f"{mode_label}按交期倒排后整单平移至优化开始日期"
+
+
+def _schedule_order_tasks_by_flow(
+    order_tasks: list[OperationTask],
+    *,
+    config: FortuneBjConfig | None,
+    mode_label: str,
+) -> list[ScheduledOperation]:
+    sorted_tasks = sorted(order_tasks, key=lambda task: task.activity)
+    if not sorted_tasks:
+        return []
+    flow_mode = _operation_flow_mode(config)
+    due_date = min(task.due_date for task in sorted_tasks)
+    if flow_mode == "交期强制":
+        return [
+            ScheduledOperation(
+                task=task,
+                start=due_date,
+                end=due_date,
+                on_time=True,
+                tardy_hours=0.0,
+                note=f"{mode_label}交期强制口径；全部工序负荷归入交期当天",
+            )
+            for task in sorted_tasks
+        ]
+
+    quantity_units = max(max(_flow_quantity_units(task.quantity) for task in sorted_tasks), 1)
+    lot_sizes = _operation_flow_lot_sizes(quantity_units, flow_mode)
+    if not lot_sizes:
+        lot_sizes = [quantity_units]
+    lot_total = max(sum(lot_sizes), 1)
+
+    previous_operation_finish: list[float] = [0.0 for _ in lot_sizes]
+    spans: list[tuple[float, float]] = []
+    makespan = 0.0
+    for operation_index, task in enumerate(sorted_tasks):
+        duration_hours = _task_flow_duration_hours(task)
+        unit_duration = duration_hours / lot_total if lot_total > 0 else duration_hours
+        current_operation_finish: list[float] = []
+        previous_lot_finish = 0.0
+        first_start: float | None = None
+        last_finish = 0.0
+        for lot_index, lot_size in enumerate(lot_sizes):
+            upstream_finish = previous_operation_finish[lot_index] if operation_index > 0 else 0.0
+            lot_start = max(previous_lot_finish, upstream_finish)
+            lot_finish = lot_start + max(float(lot_size), 0.0) * unit_duration
+            if first_start is None:
+                first_start = lot_start
+            previous_lot_finish = lot_finish
+            current_operation_finish.append(lot_finish)
+            last_finish = lot_finish
+        spans.append((first_start or 0.0, last_finish))
+        previous_operation_finish = current_operation_finish
+        makespan = max(makespan, last_finish)
+
+    order_start = due_date - timedelta(hours=makespan)
+    items: list[ScheduledOperation] = []
+    for task, (start_offset, end_offset) in zip(sorted_tasks, spans):
+        start = order_start + timedelta(hours=start_offset)
+        end = order_start + timedelta(hours=end_offset)
+        if task.is_outsource:
+            note = f"{mode_label}{flow_mode}倒排；外协固定7天，不占用本地资源"
+        else:
+            note = f"{mode_label}{flow_mode}倒排"
+        items.append(ScheduledOperation(
+            task=task,
+            start=start,
+            end=end,
+            on_time=end <= task.due_date,
+            tardy_hours=max((end - task.due_date).total_seconds() / 3600.0, 0.0),
+            note=note,
+        ))
+    return items
+
+
+def _operation_flow_mode(config: FortuneBjConfig | None) -> str:
+    text = _clean_text(config.operation_flow_mode if config is not None else "") or "整批流转"
+    if "交期" in text:
+        return "交期强制"
+    if "单件" in text:
+        return "单件流转"
+    if "半批" in text:
+        return "半批流转"
+    return "整批流转"
+
+
+def _flow_quantity_units(quantity: Any) -> int:
+    value = _to_number(quantity, default=0.0)
+    if value <= 0:
+        return 1
+    rounded = int(round(value))
+    if abs(value - rounded) <= 1e-6:
+        return max(rounded, 1)
+    return max(int(math.ceil(value)), 1)
+
+
+def _operation_flow_lot_sizes(quantity_units: int, flow_mode: str) -> list[int]:
+    quantity_units = max(int(quantity_units), 1)
+    if flow_mode == "单件流转":
+        return [1 for _ in range(quantity_units)]
+    if flow_mode == "半批流转":
+        first = int(math.ceil(quantity_units / 2))
+        second = quantity_units - first
+        return [first] + ([second] if second > 0 else [])
+    return [quantity_units]
+
+
+def _task_flow_duration_hours(task: OperationTask) -> float:
+    if task.is_outsource:
+        return float(OUTSOURCE_DURATION_HOURS)
+    return max(float(task.duration_hours or 0.0), 0.0)
 
 
 def _schedule_tasks_infinite_capacity(
@@ -1143,26 +1664,7 @@ def _schedule_tasks_infinite_capacity(
         tasks_by_order,
         key=order_sort_key,
     ):
-        order_tasks = sorted(tasks_by_order[order_id], key=lambda task: task.activity)
-        cursor = min(task.due_date for task in order_tasks)
-        reverse_items: list[ScheduledOperation] = []
-        for task in reversed(order_tasks):
-            if task.is_outsource:
-                start = cursor - timedelta(hours=OUTSOURCE_DURATION_HOURS)
-                note = "ModeA无限产能倒排；外协固定7天，不占用本地资源"
-            else:
-                start = cursor - timedelta(hours=task.duration_hours)
-                note = "ModeA无限产能倒排"
-            reverse_items.append(ScheduledOperation(
-                task=task,
-                start=start,
-                end=cursor,
-                on_time=cursor <= task.due_date,
-                tardy_hours=max((cursor - task.due_date).total_seconds() / 3600.0, 0.0),
-                note=note,
-            ))
-            cursor = start
-        order_items = list(reversed(reverse_items))
+        order_items = _schedule_order_tasks_by_flow(tasks_by_order[order_id], config=config, mode_label="ModeA")
         _shift_order_items_to_optimization_start(order_items, config=config, mode_label="ModeA")
         scheduled.extend(order_items)
     return scheduled
@@ -1187,27 +1689,7 @@ def _schedule_tasks_modeb_backward_with_start_shift(
         return first_period_start, priority_rank, priority_date, due_date, key
 
     for order_id in sorted(tasks_by_order, key=order_sort_key):
-        order_tasks = sorted(tasks_by_order[order_id], key=lambda task: task.activity)
-        cursor = min(task.due_date for task in order_tasks)
-        reverse_items: list[ScheduledOperation] = []
-        for task in reversed(order_tasks):
-            duration_hours = OUTSOURCE_DURATION_HOURS if task.is_outsource else max(float(task.duration_hours), 0.0)
-            start = cursor - timedelta(hours=duration_hours)
-            if task.is_outsource:
-                note = "ModeB按交期倒排基线；外协固定7天，不占用本地资源"
-            else:
-                note = "ModeB按交期倒排基线"
-            reverse_items.append(ScheduledOperation(
-                task=task,
-                start=start,
-                end=cursor,
-                on_time=cursor <= task.due_date,
-                tardy_hours=max((cursor - task.due_date).total_seconds() / 3600.0, 0.0),
-                note=note,
-            ))
-            cursor = start
-
-        order_items = list(reversed(reverse_items))
+        order_items = _schedule_order_tasks_by_flow(tasks_by_order[order_id], config=config, mode_label="ModeB")
         _shift_order_items_to_optimization_start(order_items, config=config, mode_label="ModeB")
         scheduled.extend(order_items)
     return scheduled
@@ -1229,8 +1711,8 @@ def _schedule_tasks_mode_b_v2(
     if progress is not None:
         progress(
             f"ModeB 100%产能优化建议: 先按订单交期倒排负荷，工序 {len(tasks):,} 条；"
-            f"优化粒度 {granularity}，优化开始周期 {_period_label_from_start(start_period, config) if start_period else '未指定'}；"
-            f"逾期订单或倒排后早于优化开始周期的订单会整单平移到优化开始周期；"
+            f"优化粒度 {granularity}，优化开始日期 {start_period.strftime('%Y-%m-%d') if start_period else '未指定'}；"
+            f"逾期订单或倒排后早于优化开始日期的订单会整单平移到优化开始日期；"
             f"在每个{granularity}内按整数产品数量分配原工作中心、可选工作中心和外包；"
             f"记录参考规模 {max_window_tasks:,} 条工序/周期，求解时间上限 "
             f"{config.mode_b_solver_max_seconds if config else 60.0} 秒"
@@ -1298,7 +1780,7 @@ def _schedule_tasks_mode_b_legacy(
     if progress is not None:
         progress(
             f"ModeB 100%产能优化建议: 先执行 ModeA 无限产能分析，工序 {len(tasks):,} 条；"
-            f"优化粒度 {granularity}，优化开始周期 {_period_label_from_start(start_period, config) if start_period else '未指定'}，"
+            f"优化粒度 {granularity}，优化开始日期 {start_period.strftime('%Y-%m-%d') if start_period else '未指定'}，"
             f"按{granularity}覆盖全部数据；"
             f"记录参考规模 {max_window_tasks:,} 条工序/周期，求解时间上限 "
             f"{config.mode_b_solver_max_seconds if config else 60.0} 秒；当前版本不按规模阈值拦截"
@@ -1425,8 +1907,8 @@ def _optimization_period_label(task: OperationTask, config: FortuneBjConfig | No
 
 def _optimization_period_end(period_start: datetime, config: FortuneBjConfig | None) -> datetime:
     if _optimization_granularity(config) == "月":
-        return _month_add(period_start, 1)
-    return period_start + timedelta(days=7)
+        return _month_add(_month_start(period_start), 1)
+    return _week_start(period_start) + timedelta(days=7)
 
 
 def _period_start_for_date(value: datetime, config: FortuneBjConfig | None) -> datetime:
@@ -1450,13 +1932,26 @@ def _period_bounds_from_label(period: str, config: FortuneBjConfig | None) -> tu
         if granularity == "月" or "-W" not in period:
             year, month = (int(part) for part in period.split("-")[:2])
             start = datetime(year, month, 1)
-            return start, _month_add(start, 1)
+            return _clip_period_bounds_to_optimization_start(start, _month_add(start, 1), config)
         year_text, week_text = period.split("-W", 1)
         start = datetime.fromisocalendar(int(year_text), int(week_text), 1)
-        return start, start + timedelta(days=7)
+        return _clip_period_bounds_to_optimization_start(start, start + timedelta(days=7), config)
     except (ValueError, IndexError):
         start = datetime(1900, 1, 1)
         return start, start + timedelta(days=30 if granularity == "月" else 7)
+
+
+def _clip_period_bounds_to_optimization_start(
+    period_start: datetime,
+    period_end: datetime,
+    config: FortuneBjConfig | None,
+) -> tuple[datetime, datetime]:
+    optimization_start = _optimization_start_period(config)
+    if optimization_start is None:
+        return period_start, period_end
+    if period_start <= optimization_start < period_end:
+        return optimization_start, period_end
+    return period_start, period_end
 
 
 def _period_display_end(period_end: datetime) -> datetime:
@@ -1639,9 +2134,8 @@ def _modeb_period_for_item(
     modeb_start = _optimization_start_period(config)
     if modeb_start is not None and anchor < modeb_start:
         anchor = modeb_start
-    start = _period_start_for_date(anchor, config)
-    end = _optimization_period_end(start, config)
-    period = _period_label_from_start(start, config)
+    period = _period_label_from_start(_period_start_for_date(anchor, config), config)
+    start, end = _period_bounds_from_label(period, config)
     return period, start, end
 
 
@@ -2309,6 +2803,11 @@ def _build_modeb_order_allocation_rows(
         for segment_index, segment in enumerate(segments, start=1):
             rows.append({
                 "订单": task.order_id,
+                "需求来源": task.demand_source,
+                "预测月份": task.forecast_month,
+                "预测周日": task.forecast_week_end,
+                "预测图号": task.forecast_drawing,
+                "路线来源订单": task.route_source_order,
                 "物料": task.material,
                 "活动": _activity_key(task.activity),
                 "工序短文本": task.process_text,
@@ -2322,7 +2821,7 @@ def _build_modeb_order_allocation_rows(
                 "优先级类型": task.priority_type,
                 "优先级原因": task.priority_reason,
                 "是否手动紧急": "是" if task.manual_urgent else "否",
-                "是否过期转入优化开始周期": "是" if task.adjusted_to_start_period else "否",
+                "是否过期转入优化开始日期": "是" if task.adjusted_to_start_period else "否",
                 "是否未维护工作中心": "是" if allocation.is_unmaintained_work_center else "否",
                 "周期": segment.period,
                 "周期粒度": _optimization_granularity(config),
@@ -3355,26 +3854,26 @@ def _split_hours_by_reporting_period(
     if total_hours <= 0:
         return []
     if end <= start:
-        period_start = _period_start_for_date(start, config)
-        period_end = _optimization_period_end(period_start, config)
+        period = _period_label_from_start(_period_start_for_date(start, config), config)
+        period_start, period_end = _period_bounds_from_label(period, config)
         return [(_period_label_from_start(period_start, config), period_start, period_end, total_hours)]
 
     elapsed_hours = (end - start).total_seconds() / 3600.0
     if elapsed_hours <= 0:
-        period_start = _period_start_for_date(start, config)
-        period_end = _optimization_period_end(period_start, config)
+        period = _period_label_from_start(_period_start_for_date(start, config), config)
+        period_start, period_end = _period_bounds_from_label(period, config)
         return [(_period_label_from_start(period_start, config), period_start, period_end, total_hours)]
 
     parts: list[tuple[str, datetime, datetime, float]] = []
     cursor = start
     while cursor < end:
-        period_start = _period_start_for_date(cursor, config)
-        period_end = _optimization_period_end(period_start, config)
+        period = _period_label_from_start(_period_start_for_date(cursor, config), config)
+        period_start, period_end = _period_bounds_from_label(period, config)
         segment_end = min(end, period_end)
         segment_elapsed_hours = (segment_end - cursor).total_seconds() / 3600.0
         if segment_elapsed_hours > 0:
             parts.append((
-                _period_label_from_start(period_start, config),
+                period,
                 period_start,
                 period_end,
                 total_hours * segment_elapsed_hours / elapsed_hours,
@@ -4123,11 +4622,12 @@ def _write_dashboard_sheet(
     ws.append([f"执行摘要 - {mode} 产能分析"])
     modeb_start = _optimization_start_period(config)
     granularity = _optimization_granularity(config)
-    modeb_start_label = _period_display_label(_period_label_from_start(modeb_start, config), config) if modeb_start else "未指定"
     ws.append([
         f"模式：{mode} | 运行时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
         f"优化粒度：{granularity} | "
-        f"优化开始周期：{modeb_start_label} | "
+        f"优化开始日期：{modeb_start.strftime('%Y-%m-%d') if modeb_start else '未指定'} | "
+        f"工序流转：{_operation_flow_mode(config)} | "
+        f"需求预测：{'启用' if config.enable_forecast else '未启用'} | "
         f"参考{config.mode_b_max_window_tasks}条工序/周期 | "
         f"工作日历：{Path(config.calendar_path).name if config.calendar_path else '默认日历'}"
     ])
@@ -4188,7 +4688,7 @@ def _write_monthly_trend_sheet(
     headers = [period_header, "日期跨度", "订单数", "厂内工序数", "外协工序数", "厂内负荷小时"]
     by_period: dict[str, dict[str, Any]] = {}
     for item in items:
-        period = _optimization_period_label(item.task, config) if period_granularity == "周" else item.task.due_date.strftime("%Y-%m")
+        period = _reporting_period_label_for_item(item, config=config)
         bucket = by_period.setdefault(period, {
             "订单": set(),
             "厂内工序数": 0,
@@ -4481,9 +4981,13 @@ def _write_summary_sheet(
         ("工作日历表", str(config.calendar_path) if config.calendar_path else ""),
         ("热处/表处模式", config.hot_surface_mode),
         ("分析模式", mode),
+        ("需求预测导入", "启用" if config.enable_forecast else "未启用"),
+        ("需求预测表", str(config.forecast_path) if config.enable_forecast and config.forecast_path else ""),
+        ("工序流转逻辑", _operation_flow_mode(config)),
         ("优化粒度", _optimization_granularity(config)),
-        ("优化开始周期", modeb_start_period),
-        ("优化开始周期日期跨度", _period_date_span(modeb_start_period, config)),
+        ("优化开始日期", modeb_start.strftime("%Y-%m-%d") if modeb_start else ""),
+        ("优化开始日期所在周期", modeb_start_period),
+        ("优化开始日期所在周期跨度", _period_date_span(modeb_start_period, config)),
         ("ModeB参考工序数/周期", config.mode_b_max_window_tasks),
         ("ModeB求解时间上限(秒)", config.mode_b_solver_max_seconds if config.mode_b_solver_max_seconds else "不限制"),
         ("ModeB整数分配候选决策工序数", modeb_stats.get("候选决策工序数", "")),
@@ -4540,10 +5044,10 @@ def _write_schedule_sheet(
 ) -> int:
     ws = wb.create_sheet(title)
     headers = [
-        "订单", "活动", "物料", "工序短文本", "工作中心", "资源组分类", "订单数量",
+        "订单", "需求来源", "预测月份", "预测周日", "预测图号", "路线来源订单", "活动", "物料", "工序短文本", "工作中心", "资源组分类", "订单数量",
         "单位工时(小时/pcs)", "工序生产时间(小时)", "本周期负荷小时", "开始时间", "完成时间", "需求日期",
         "原始供给日期", "调整后供给日期", "紧急类型", "是否紧急", "订单优先级", "优先级类型", "优先级原因",
-        "是否手动紧急", "是否过期转入优化开始周期", "是否热处/表处", "是否外协", "是否未维护工作中心",
+        "是否手动紧急", "是否过期转入优化开始日期", "是否热处/表处", "是否外协", "是否未维护工作中心",
         "周期", "周期粒度", "周期日期跨度",
         "未维护负荷小时",
         "分析口径", "分析来源", "窗口编号", "窗口类型", "说明",
@@ -4558,6 +5062,11 @@ def _write_schedule_sheet(
             row_number += 1
             ws.append([
                 item.task.order_id,
+                item.task.demand_source,
+                item.task.forecast_month,
+                item.task.forecast_week_end,
+                item.task.forecast_drawing,
+                item.task.route_source_order,
                 item.task.activity,
                 item.task.material,
                 item.task.process_text,
@@ -4881,31 +5390,56 @@ def _format_workcenter_heatmap(ws, header_row: int = 3) -> None:
             if isinstance(cell.value, (int, float)):
                 if "负荷率" in metric:
                     cell.number_format = "0.0%"
-                    cell.fill = _red_heatmap_fill(cell.value)
+                    cell.fill = _capacity_heatmap_fill(cell.value)
                     cell.font = Font(
-                        color="FFFFFF" if float(cell.value) >= 0.85 else "000000",
-                        bold=float(cell.value) >= 1.0,
+                        color=_heatmap_font_color(cell.value),
+                        bold=_heatmap_font_bold(cell.value),
                     )
                 else:
                     cell.number_format = "#,##0.0"
             elif "负荷率" in metric and cell.value in (None, ""):
-                cell.fill = _red_heatmap_fill(0)
+                cell.fill = PatternFill()
     ws.row_dimensions[1].height = 24
     ws.row_dimensions[2].height = 22
     ws.row_dimensions[header_row].height = max(ws.row_dimensions[header_row].height or 0, 24)
     ws.freeze_panes = None
 
 
-def _red_heatmap_fill(value: Any) -> PatternFill:
+def _capacity_heatmap_fill(value: Any) -> PatternFill:
     try:
         ratio = float(value)
     except (TypeError, ValueError):
         ratio = 0.0
-    ratio = max(0.0, min(ratio, 1.0))
-    light = (252, 228, 214)
-    dark = (192, 0, 0)
-    rgb = tuple(round(light[idx] + (dark[idx] - light[idx]) * ratio) for idx in range(3))
+    ratio = max(0.0, ratio)
+    if ratio <= 1.0:
+        start = (0, 97, 0)
+        end = (198, 239, 206)
+        weight = ratio
+    else:
+        start = (252, 228, 214)
+        end = (192, 0, 0)
+        weight = min((ratio - 1.0) / 2.0, 1.0)
+    rgb = tuple(round(start[idx] + (end[idx] - start[idx]) * weight) for idx in range(3))
     return PatternFill("solid", fgColor=f"{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}")
+
+
+def _heatmap_font_color(value: Any) -> str:
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        ratio = 0.0
+    if ratio <= 0.35:
+        return "FFFFFF"
+    if ratio >= 1.75:
+        return "FFFFFF"
+    return "000000"
+
+
+def _heatmap_font_bold(value: Any) -> bool:
+    try:
+        return float(value) >= 1.0
+    except (TypeError, ValueError):
+        return False
 
 
 def _format_dashboard(ws) -> None:
@@ -5182,7 +5716,7 @@ def _priority_from_flags(urgent_type: str, overdue: bool) -> tuple[int, str, str
             f"订单交期数量表手动填写紧急类型：{urgent_type}",
         )
     if overdue:
-        return PRIORITY_OVERDUE, "过期订单", "原始供给日期早于优化开始周期"
+        return PRIORITY_OVERDUE, "过期订单", "原始供给日期早于优化开始日期"
     return PRIORITY_NORMAL, "普通订单", "未标记紧急且未过期"
 
 
