@@ -92,6 +92,11 @@ LICENSE_ACTIVE_DIR = DEPLOY_ROOT / "licenses" / "active"
 LICENSE_REQUESTS_DIR = DEPLOY_ROOT / "licenses" / "requests"
 LOG_DIR = DEPLOY_ROOT / "logs"
 
+
+def _display_path(path: str | Path) -> str:
+    return str(path).replace("/", "\\")
+
+
 LIGHT_QSS = """
 QWidget {
     background: #f4f6fa;
@@ -511,9 +516,9 @@ class MainWindow(QMainWindow):
 
         paths = CardFrame("目录")
         path_form = QFormLayout()
-        self.deploy_root_label = QLineEdit(str(DEPLOY_ROOT))
+        self.deploy_root_label = QLineEdit(_display_path(DEPLOY_ROOT))
         self.deploy_root_label.setReadOnly(True)
-        self.data_dir_label = QLineEdit(str(DATA_DIR))
+        self.data_dir_label = QLineEdit(_display_path(DATA_DIR))
         self.data_dir_label.setReadOnly(True)
         path_form.addRow("应用目录", self.deploy_root_label)
         path_form.addRow("数据导入目录", self.data_dir_label)
@@ -583,7 +588,7 @@ class MainWindow(QMainWindow):
         self.mode_b_optimization_granularity.currentTextChanged.connect(self._handle_optimization_granularity_changed)
 
     def _path_edit(self, path: Path) -> QLineEdit:
-        edit = QLineEdit(str(path))
+        edit = QLineEdit(_display_path(path))
         edit.setMinimumWidth(620)
         return edit
 
@@ -639,7 +644,20 @@ class MainWindow(QMainWindow):
         else:
             selected = QFileDialog.getExistingDirectory(self, "选择文件夹", edit.text())
         if selected:
-            edit.setText(selected)
+            edit.setText(_display_path(selected))
+
+    def _normalize_path_fields(self) -> None:
+        for edit in (
+            getattr(self, "ops_path", None),
+            getattr(self, "demand_path", None),
+            getattr(self, "wc_path", None),
+            getattr(self, "optional_ops_path", None),
+            getattr(self, "calendar_path", None),
+            getattr(self, "forecast_path", None),
+            getattr(self, "out_dir", None),
+        ):
+            if edit is not None:
+                edit.setText(_display_path(edit.text()))
 
     def refresh_license_status(self) -> None:
         info, error = inspect_license()
@@ -649,7 +667,7 @@ class MainWindow(QMainWindow):
             self.license_id.setText("")
             self.license_customer.setText("")
             self.license_expiry.setText("")
-            self.license_path.setText(str(LICENSE_ACTIVE_DIR / "license.json"))
+            self.license_path.setText(_display_path(LICENSE_ACTIVE_DIR / "license.json"))
             self.license_message.setPlainText(error)
             return
         self.sidebar_status.setText(f"授权状态：有效，{info.expiry_date} 到期")
@@ -657,7 +675,7 @@ class MainWindow(QMainWindow):
         self.license_id.setText(info.license_id)
         self.license_customer.setText(info.customer_name)
         self.license_expiry.setText(info.expiry_date)
-        self.license_path.setText(info.license_path)
+        self.license_path.setText(_display_path(info.license_path))
         self.license_message.setPlainText(
             "\n".join([
                 f"License ID: {info.license_id}",
@@ -666,7 +684,7 @@ class MainWindow(QMainWindow):
                 f"Binding: {info.binding_mode}",
                 f"Machine: {info.machine_label}",
                 f"Features: {json.dumps(info.features, ensure_ascii=False)}",
-                f"File: {info.license_path}",
+                f"File: {_display_path(info.license_path)}",
             ])
         )
 
@@ -676,12 +694,13 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._show_error("生成机器指纹失败", str(exc))
             return
-        self._log(f"机器指纹请求已生成：{path}")
-        QMessageBox.information(self, "完成", f"机器指纹请求已生成：\n{path}")
+        self._log(f"机器指纹请求已生成：{_display_path(path)}")
+        QMessageBox.information(self, "完成", f"机器指纹请求已生成：\n{_display_path(path)}")
 
     def run_schedule(self) -> None:
         self._begin_run_log("schedule")
         self._log("Run requested: schedule")
+        self._normalize_path_fields()
         self.refresh_license_status()
         info, error = inspect_license()
         if info is None:
@@ -756,8 +775,8 @@ class MainWindow(QMainWindow):
         self.progress_phase.setText("当前阶段：完成")
         self.progress_bar.setValue(1000)
         self.progress_metrics.setText("进度：100% | 已完成")
-        self._log(f"运行完成，报告已生成：{report_path}")
-        self._finish_run_log("SUCCESS", f"Report: {report_path}")
+        self._log(f"运行完成，报告已生成：{_display_path(report_path)}")
+        self._finish_run_log("SUCCESS", f"Report: {_display_path(report_path)}")
         self._show_run_complete_dialog(Path(report_path))
 
     def _run_failed(self, error: str) -> None:
@@ -800,7 +819,7 @@ class MainWindow(QMainWindow):
         dialog.setIcon(QMessageBox.Information)
         dialog.setWindowTitle("运行完成")
         dialog.setText("报告已生成。")
-        dialog.setInformativeText(str(report_path))
+        dialog.setInformativeText(_display_path(report_path))
         open_button = dialog.addButton("打开报告", QMessageBox.AcceptRole)
         dialog.addButton("关闭", QMessageBox.RejectRole)
         dialog.setDefaultButton(open_button)

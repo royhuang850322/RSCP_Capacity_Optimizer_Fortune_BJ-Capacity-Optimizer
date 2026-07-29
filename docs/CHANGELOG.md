@@ -1,5 +1,11 @@
 # Fortune BJ Capacity Optimizer Changelog
 
+## v0.1.6 - 2026-07-29
+
+- Normalize GUI path display to Windows backslashes after browsing for files or folders.
+- Normalize manually pasted path fields before starting an analysis run.
+- Keep report, license, and fingerprint path messages consistent with Windows path separators.
+
 ## v0.1.5 - 2026-07-29
 
 - Change forecast-demand routing to use `工艺路线-北京.xlsx`, `工艺路线-沈阳.xlsx`, and `工艺路线-南通.xlsx` instead of production-order history.
