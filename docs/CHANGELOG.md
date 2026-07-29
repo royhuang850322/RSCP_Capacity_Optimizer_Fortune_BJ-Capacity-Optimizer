@@ -1,5 +1,14 @@
 # Fortune BJ Capacity Optimizer Changelog
 
+## v0.1.5 - 2026-07-29
+
+- Change forecast-demand routing to use `工艺路线-北京.xlsx`, `工艺路线-沈阳.xlsx`, and `工艺路线-南通.xlsx` instead of production-order history.
+- Match forecast routes by priority: Beijing, then Shenyang, then Nantong.
+- Skip unmatched forecast materials without blocking the run and list them in the data-quality report.
+- Add forecast route source fields to ModeA and ModeB order-operation detail reports.
+- Change workgroup heatmap coloring to four fixed bands: 0-25% dark green, 25-75% light green, 75-100% light red, and above 100% dark red.
+- Remove `模拟数据导入` from packaged application output.
+
 ## v0.1.4 - 2026-07-29
 
 - Add optional demand forecast import from `需求预测_产能分析输入模板.xlsx`, generating weekly Sunday virtual forecast orders with `FCST-YYYYMMDD-物料号` order numbers.

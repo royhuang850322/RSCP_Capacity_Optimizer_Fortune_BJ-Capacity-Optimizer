@@ -54,6 +54,12 @@ WC_TEMPLATE_NAME = "工作中心_产能分析输入模板.xlsx"
 OPTIONAL_OPS_TEMPLATE_NAME = "可选工序_产能分析输入模板.xlsx"
 CALENDAR_TEMPLATE_NAME = "工作日历_产能分析输入模板.xlsx"
 FORECAST_TEMPLATE_NAME = "需求预测_产能分析输入模板.xlsx"
+FORECAST_ROUTE_SHEET_NAME = "Data"
+FORECAST_ROUTE_TEMPLATE_SPECS: tuple[tuple[str, str], ...] = (
+    ("北京", "工艺路线-北京.xlsx"),
+    ("沈阳", "工艺路线-沈阳.xlsx"),
+    ("南通", "工艺路线-南通.xlsx"),
+)
 
 PLACEHOLDER_DUE_YEAR = 2049
 OUTSOURCE_DURATION_HOURS = 7 * 24
@@ -170,6 +176,7 @@ class OperationTask:
     forecast_month: str = ""
     forecast_week_end: str = ""
     forecast_drawing: str = ""
+    forecast_route_source: str = ""
     route_source_order: str = ""
     is_outsource: bool = False
     missing_work_center: bool = False
@@ -981,8 +988,8 @@ def load_forecast_demand(config: FortuneBjConfig) -> tuple[dict[str, dict[str, A
     if issues:
         return {}, issues
 
-    operations_df = _read_workbook_first_sheet(config.operations_path)
-    route_templates = _select_route_templates_by_material(operations_df)
+    route_templates, route_issues = _load_forecast_route_templates()
+    issues.extend(route_issues)
     material_col = "物料编码"
     drawing_col = "图号" if "图号" in df.columns else ""
     month_columns: list[tuple[Any, int, int]] = []
@@ -1016,6 +1023,7 @@ def load_forecast_demand(config: FortuneBjConfig) -> tuple[dict[str, dict[str, A
         drawing = _clean_text(row.get(drawing_col)) if drawing_col else ""
         route_template = route_templates.get(material)
         route_source_order = str(route_template.get("source_order") or "") if route_template else ""
+        forecast_route_source = str(route_template.get("route_source") or "") if route_template else ""
         has_positive_forecast = False
         for column, year, month in month_columns:
             raw_value = row.get(column)
@@ -1075,6 +1083,7 @@ def load_forecast_demand(config: FortuneBjConfig) -> tuple[dict[str, dict[str, A
                         "预测周日": due_date.strftime("%Y-%m-%d"),
                         "预测物料": material,
                         "预测图号": drawing,
+                        "预测工艺路线来源": forecast_route_source,
                         "路线来源订单": route_source_order,
                     }
                     continue
@@ -1082,12 +1091,12 @@ def load_forecast_demand(config: FortuneBjConfig) -> tuple[dict[str, dict[str, A
         if route_template is None and has_positive_forecast and material not in missing_route_materials:
             missing_route_materials.add(material)
             issues.append({
-                "类型": "预测物料缺少工艺路线",
+                "类型": "预测物料缺少工艺路线，未参与计算",
                 "文件": str(path),
                 "行号": idx + 2,
                 "物料": material,
                 "图号": drawing,
-                "说明": "该预测物料在生产订单工序文件中找不到同物料历史工艺路线，正式产能分析已停止。",
+                "说明": "该预测物料在北京、沈阳、南通工艺路线文件中均找不到匹配路线，已跳过，不参与本次产能计算。",
             })
     return demand, issues
 
@@ -1099,7 +1108,6 @@ def _blocking_forecast_issues(issues: list[dict[str, Any]]) -> list[dict[str, An
         "需求预测清单缺失",
         "需求预测月份列异常",
         "需求预测数量异常",
-        "预测物料缺少工艺路线",
     }
     return [row for row in issues if str(row.get("类型") or "") in blocking_types]
 
@@ -1152,6 +1160,153 @@ def _split_monthly_forecast_to_sundays(year: int, month: int, quantity: int) -> 
         if weekly_quantity > 0:
             rows.append((due_date, weekly_quantity))
     return rows
+
+
+def _load_forecast_route_templates() -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    route_templates: dict[str, dict[str, Any]] = {}
+    issues: list[dict[str, Any]] = []
+    for priority, (route_source, filename) in enumerate(FORECAST_ROUTE_TEMPLATE_SPECS, start=1):
+        path = DATA_DIR / filename
+        if not path.exists():
+            issues.append({
+                "类型": "预测工艺路线文件缺失",
+                "文件": str(path),
+                "预测工艺路线来源": route_source,
+                "优先级": priority,
+                "说明": "该工艺路线文件不存在；预测需求将继续尝试其他工艺路线文件。",
+            })
+            continue
+        try:
+            df = _read_workbook_sheet(path, FORECAST_ROUTE_SHEET_NAME)
+        except ValueError as exc:
+            issues.append({
+                "类型": "预测工艺路线清单缺失",
+                "文件": str(path),
+                "预测工艺路线来源": route_source,
+                "优先级": priority,
+                "说明": str(exc),
+            })
+            continue
+        source_templates, source_issues = _select_forecast_route_templates_by_material(
+            df,
+            route_source=route_source,
+            route_file=path,
+            priority=priority,
+        )
+        issues.extend(source_issues)
+        for material, route in source_templates.items():
+            if material not in route_templates:
+                route_templates[material] = route
+    return route_templates, issues
+
+
+def _select_forecast_route_templates_by_material(
+    route_df: pd.DataFrame,
+    *,
+    route_source: str,
+    route_file: Path,
+    priority: int,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    column_map = _forecast_route_column_map(route_df)
+    if column_map is None:
+        return {}, [{
+            "类型": "预测工艺路线字段缺失",
+            "文件": str(route_file),
+            "预测工艺路线来源": route_source,
+            "优先级": priority,
+            "说明": "工艺路线Data sheet至少需要包含到I列：B列物料编码、E列工作中心描述、F列工序编码、G列准备/H、H列人工/H、I列设备/H。",
+        }]
+
+    identity_columns = [
+        route_df.columns[index]
+        for index in (0, 3, 11, 12, 15, 16)
+        if index < len(route_df.columns)
+    ]
+    grouped: dict[tuple[str, tuple[str, ...]], dict[str, Any]] = {}
+    for idx, row in route_df.iterrows():
+        material = _clean_text(row.get(column_map["material"]))
+        if not material:
+            continue
+        activity = _to_number(row.get(column_map["activity"]), default=0.0)
+        process_text = _clean_text(row.get(column_map["process_text"]))
+        unit_hour_values = {
+            "标准值1": _to_number(row.get(column_map["standard_1"]), default=0.0),
+            "标准值2": _to_number(row.get(column_map["standard_2"]), default=0.0),
+            "标准值3": _to_number(row.get(column_map["standard_3"]), default=0.0),
+        }
+        route_identity = tuple(_clean_text(row.get(column)) for column in identity_columns)
+        key = (material, route_identity)
+        route_key_text = " | ".join(value for value in route_identity if value)
+        item = grouped.setdefault(key, {
+            "material": material,
+            "source_order": "",
+            "source_key": route_key_text,
+            "route_source": route_source,
+            "route_file": str(route_file),
+            "route_priority": priority,
+            "rows": [],
+            "activities": set(),
+            "total_unit_hours": 0.0,
+            "first_row": idx + 2,
+        })
+        internal_row = {
+            "物料": material,
+            "活动": activity,
+            "工序短文本": process_text,
+            "标准值1": unit_hour_values["标准值1"],
+            "标准值2": unit_hour_values["标准值2"],
+            "标准值3": unit_hour_values["标准值3"],
+            "预测工艺路线来源": route_source,
+            "预测工艺路线文件": str(route_file),
+            "预测工艺路线源文件行号": idx + 2,
+            "预测工艺路线标识": route_key_text,
+            "工作中心代码": _clean_text(row.get("工作中心代码")),
+            "客户图号": _clean_text(row.get("客户图号")),
+            "版本号": _clean_text(row.get("版本号")),
+            "SAP版本号": _clean_text(row.get("SAP版本号")),
+            "工艺类型": _clean_text(row.get("工艺类型")),
+        }
+        item["rows"].append((idx, internal_row))
+        item["activities"].add(_activity_key(activity))
+        item["total_unit_hours"] += sum(unit_hour_values.values())
+        item["first_row"] = min(int(item["first_row"]), idx + 2)
+
+    selected: dict[str, dict[str, Any]] = {}
+    for route in grouped.values():
+        material = str(route["material"])
+        current = selected.get(material)
+        route_key = (
+            len(route["activities"]),
+            len(route["rows"]),
+            float(route["total_unit_hours"]),
+            -int(route["first_row"]),
+            str(route["source_key"]),
+        )
+        current_key = (
+            len(current["activities"]),
+            len(current["rows"]),
+            float(current["total_unit_hours"]),
+            -int(current["first_row"]),
+            str(current["source_key"]),
+        ) if current else None
+        if current is None or route_key > current_key:
+            selected[material] = route
+    for route in selected.values():
+        route["rows"] = sorted(route["rows"], key=lambda item: (_to_number(item[1].get("活动"), default=0.0), item[0]))
+    return selected, []
+
+
+def _forecast_route_column_map(route_df: pd.DataFrame) -> dict[str, Any] | None:
+    if len(route_df.columns) <= 8:
+        return None
+    return {
+        "material": route_df.columns[1],
+        "process_text": route_df.columns[4],
+        "activity": route_df.columns[5],
+        "standard_1": route_df.columns[6],
+        "standard_2": route_df.columns[7],
+        "standard_3": route_df.columns[8],
+    }
 
 
 def _select_route_templates_by_material(operation_df: pd.DataFrame) -> dict[str, dict[str, Any]]:
@@ -1306,6 +1461,7 @@ def load_operation_tasks(
             forecast_month=str(demand.get("预测月份") or ""),
             forecast_week_end=str(demand.get("预测周日") or ""),
             forecast_drawing=str(demand.get("预测图号") or ""),
+            forecast_route_source=str(demand.get("预测工艺路线来源") or ""),
             route_source_order=str(demand.get("路线来源订单") or ""),
             is_outsource=is_outsource,
             missing_work_center=missing_work_center,
@@ -1365,7 +1521,7 @@ def _build_forecast_operation_tasks(
     if not forecast_demands:
         return [], [], []
 
-    route_templates = _select_route_templates_by_material(operation_df)
+    route_templates, _route_issues = _load_forecast_route_templates()
     tasks: list[OperationTask] = []
     missing_mapping: list[dict[str, Any]] = []
     issues: list[dict[str, Any]] = []
@@ -1374,10 +1530,10 @@ def _build_forecast_operation_tasks(
         route = route_templates.get(material)
         if route is None:
             issues.append({
-                "类型": "预测物料缺少工艺路线",
+                "类型": "预测虚拟订单缺少工艺路线，未参与计算",
                 "订单": order_id,
                 "物料": material,
-                "说明": "该预测虚拟订单未找到同物料历史工艺路线，已跳过工序生成。",
+                "说明": "该预测虚拟订单未找到北京、沈阳、南通工艺路线，已跳过工序生成。",
             })
             continue
         for idx, row in route["rows"]:
@@ -1395,6 +1551,7 @@ def _build_forecast_operation_tasks(
                 _to_number(row.get("单件容量占用"), default=0.0),
                 capacity.default_unit_capacity if capacity else 1.0,
             )
+            source_row = int(_to_number(row.get("预测工艺路线源文件行号"), default=idx + 2))
             quantity = float(demand.get("数量") or 0.0)
             duration = _operation_load_hours(
                 quantity=quantity,
@@ -1412,8 +1569,10 @@ def _build_forecast_operation_tasks(
                     "活动": activity,
                     "物料": route_material,
                     "工序短文本": process_text,
-                    "源文件行号": idx + 2,
-                    "处理建议": "预测需求采用历史工艺路线；请在工作中心模板中补充该工序短文本对应的工作中心、资源组分类、设备数量和日历名称。",
+                    "源文件行号": source_row,
+                    "预测工艺路线来源": str(route.get("route_source") or row.get("预测工艺路线来源") or ""),
+                    "预测工艺路线文件": str(route.get("route_file") or row.get("预测工艺路线文件") or ""),
+                    "处理建议": "预测需求采用工艺路线文件；请在工作中心模板中补充该工序短文本对应的工作中心、资源组分类、设备数量和日历名称。",
                 })
             tasks.append(OperationTask(
                 order_id=order_id,
@@ -1439,16 +1598,17 @@ def _build_forecast_operation_tasks(
                 forecast_month=str(demand.get("预测月份") or ""),
                 forecast_week_end=str(demand.get("预测周日") or ""),
                 forecast_drawing=str(demand.get("预测图号") or ""),
+                forecast_route_source=str(route.get("route_source") or row.get("预测工艺路线来源") or demand.get("预测工艺路线来源") or ""),
                 route_source_order=str(route.get("source_order") or demand.get("路线来源订单") or ""),
                 is_outsource=is_outsource,
                 missing_work_center=missing_work_center,
                 is_hot_surface=is_hot_surface,
-                source_row=idx + 2,
+                source_row=source_row,
                 capacity_calc_type=capacity_calc_type,
                 hot_surface_type=hot_surface_type,
                 process_group=process_group,
                 unit_capacity=unit_capacity,
-                allow_batch_mix=_to_bool(row.get("是否允许合炉")) if "是否允许合炉" in operation_df.columns else True,
+                allow_batch_mix=_to_bool(row.get("是否允许合炉")) if "是否允许合炉" in row else True,
                 must_same_batch=_to_bool(row.get("是否必须整单同批")),
                 treatment_program=_clean_text(row.get("热处/表处程序")),
             ))
@@ -2716,6 +2876,8 @@ def _build_modeb_optional_allocation_rows(
                 "周期": segment.period,
                 "周期日期跨度": _period_span_from_bounds(segment.period_start, segment.period_end),
                 "订单": task.order_id,
+                "需求来源": task.demand_source,
+                "预测工艺路线来源": task.forecast_route_source,
                 "物料": task.material,
                 "活动": _activity_key(task.activity),
                 "工序短文本": task.process_text,
@@ -2807,6 +2969,7 @@ def _build_modeb_order_allocation_rows(
                 "预测月份": task.forecast_month,
                 "预测周日": task.forecast_week_end,
                 "预测图号": task.forecast_drawing,
+                "预测工艺路线来源": task.forecast_route_source,
                 "路线来源订单": task.route_source_order,
                 "物料": task.material,
                 "活动": _activity_key(task.activity),
@@ -3629,6 +3792,13 @@ def _build_input_maintenance_report(config: FortuneBjConfig) -> list[dict[str, A
             "是否必填": "可选维护",
             "适用逻辑": "热处/表处专用逻辑",
             "维护说明": "用于覆盖工作中心默认值和后续批次兼容分析；当前版本按周期容量汇总，不做炉次执行排程。",
+        },
+        {
+            "输入文件": "工艺路线-北京.xlsx / 工艺路线-沈阳.xlsx / 工艺路线-南通.xlsx",
+            "字段": "Data sheet：B列物料编码、E列工作中心描述、F列工序编码、G列准备/H、H列人工/H、I列设备/H",
+            "是否必填": "启用需求预测时建议维护",
+            "适用逻辑": "需求预测导入",
+            "维护说明": "预测需求按北京、沈阳、南通优先级匹配工艺路线；匹配不到的预测物料不参与计算，并进入数据质量报告。",
         },
         {
             "输入文件": OPTIONAL_OPS_TEMPLATE_NAME,
@@ -4972,6 +5142,12 @@ def _write_summary_sheet(
     )
     modeb_start = _optimization_start_period(config)
     modeb_start_period = _period_label_from_start(modeb_start, config) if modeb_start else ""
+    forecast_route_files = "；".join(filename for _source, filename in FORECAST_ROUTE_TEMPLATE_SPECS)
+    unmatched_forecast_materials = {
+        str(row.get("物料") or "")
+        for row in result.data_issues
+        if str(row.get("类型") or "") == "预测物料缺少工艺路线，未参与计算" and row.get("物料")
+    }
     rows = [
         ("运行时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         ("工具版本", APP_VERSION),
@@ -4983,6 +5159,9 @@ def _write_summary_sheet(
         ("分析模式", mode),
         ("需求预测导入", "启用" if config.enable_forecast else "未启用"),
         ("需求预测表", str(config.forecast_path) if config.enable_forecast and config.forecast_path else ""),
+        ("预测工艺路线优先级", "北京 > 沈阳 > 南通" if config.enable_forecast else ""),
+        ("预测工艺路线文件", forecast_route_files if config.enable_forecast else ""),
+        ("预测物料未匹配数", len(unmatched_forecast_materials) if config.enable_forecast else ""),
         ("工序流转逻辑", _operation_flow_mode(config)),
         ("优化粒度", _optimization_granularity(config)),
         ("优化开始日期", modeb_start.strftime("%Y-%m-%d") if modeb_start else ""),
@@ -5044,7 +5223,7 @@ def _write_schedule_sheet(
 ) -> int:
     ws = wb.create_sheet(title)
     headers = [
-        "订单", "需求来源", "预测月份", "预测周日", "预测图号", "路线来源订单", "活动", "物料", "工序短文本", "工作中心", "资源组分类", "订单数量",
+        "订单", "需求来源", "预测月份", "预测周日", "预测图号", "预测工艺路线来源", "路线来源订单", "活动", "物料", "工序短文本", "工作中心", "资源组分类", "订单数量",
         "单位工时(小时/pcs)", "工序生产时间(小时)", "本周期负荷小时", "开始时间", "完成时间", "需求日期",
         "原始供给日期", "调整后供给日期", "紧急类型", "是否紧急", "订单优先级", "优先级类型", "优先级原因",
         "是否手动紧急", "是否过期转入优化开始日期", "是否热处/表处", "是否外协", "是否未维护工作中心",
@@ -5066,6 +5245,7 @@ def _write_schedule_sheet(
                 item.task.forecast_month,
                 item.task.forecast_week_end,
                 item.task.forecast_drawing,
+                item.task.forecast_route_source,
                 item.task.route_source_order,
                 item.task.activity,
                 item.task.material,
@@ -5411,16 +5591,13 @@ def _capacity_heatmap_fill(value: Any) -> PatternFill:
     except (TypeError, ValueError):
         ratio = 0.0
     ratio = max(0.0, ratio)
+    if ratio <= 0.25:
+        return PatternFill("solid", fgColor="006100")
+    if ratio <= 0.75:
+        return PatternFill("solid", fgColor="C6EFCE")
     if ratio <= 1.0:
-        start = (0, 97, 0)
-        end = (198, 239, 206)
-        weight = ratio
-    else:
-        start = (252, 228, 214)
-        end = (192, 0, 0)
-        weight = min((ratio - 1.0) / 2.0, 1.0)
-    rgb = tuple(round(start[idx] + (end[idx] - start[idx]) * weight) for idx in range(3))
-    return PatternFill("solid", fgColor=f"{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}")
+        return PatternFill("solid", fgColor="FCE4D6")
+    return PatternFill("solid", fgColor="C00000")
 
 
 def _heatmap_font_color(value: Any) -> str:
@@ -5428,9 +5605,7 @@ def _heatmap_font_color(value: Any) -> str:
         ratio = float(value)
     except (TypeError, ValueError):
         ratio = 0.0
-    if ratio <= 0.35:
-        return "FFFFFF"
-    if ratio >= 1.75:
+    if ratio <= 0.25 or ratio > 1.0:
         return "FFFFFF"
     return "000000"
 

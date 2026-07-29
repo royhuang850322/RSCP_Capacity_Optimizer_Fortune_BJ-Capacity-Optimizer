@@ -7,7 +7,6 @@ if ($LASTEXITCODE -ne 0) {
 }
 $DistRoot = Join-Path $ProjectRoot "dist\FortuneBJOptimizer"
 $DataDirName = -join ([char[]](0x6570, 0x636e, 0x5bfc, 0x5165))
-$DemoDirName = -join ([char[]](0x6a21, 0x62df, 0x6570, 0x636e, 0x5bfc, 0x5165))
 $ReportDirName = -join ([char[]](0x62a5, 0x544a))
 
 $DataTarget = Join-Path $DistRoot $DataDirName
@@ -15,15 +14,6 @@ New-Item -ItemType Directory -Force -Path $DataTarget | Out-Null
 $DataSource = Join-Path $ProjectRoot $DataDirName
 foreach ($Pattern in @("*.csv", "*.xlsx", "*.xls")) {
     Copy-Item -Path (Join-Path $DataSource $Pattern) -Destination $DataTarget -Force -ErrorAction SilentlyContinue
-}
-
-$DemoSource = Join-Path $ProjectRoot $DemoDirName
-if (Test-Path -LiteralPath $DemoSource) {
-    $DemoTarget = Join-Path $DistRoot $DemoDirName
-    New-Item -ItemType Directory -Force -Path $DemoTarget | Out-Null
-    foreach ($Pattern in @("*.csv", "*.xlsx", "*.xls")) {
-        Copy-Item -Path (Join-Path $DemoSource $Pattern) -Destination $DemoTarget -Force -ErrorAction SilentlyContinue
-    }
 }
 
 $LicenseTarget = Join-Path $DistRoot "licenses\active"
