@@ -1,5 +1,18 @@
 # Fortune BJ Capacity Optimizer Changelog
 
+## v0.1.7 - 2026-08-12
+
+- Replace the workgroup heatmap with a customer-facing equipment resource matrix grouped by work-center major category and resource group.
+- Add demand hours, theoretical hours, load, and rounded-up equipment demand quantity to the heatmap, with four fixed load color bands.
+- Add forecast BOM expansion from Beijing, Shenyang, and Nantong BOM workbooks before forecast route matching.
+- Treat forecast top materials as manufactured items and include lower-level `M` manufactured components with full-batch kitting precedence.
+- Keep missing forecast BOM and route data non-blocking, skip only unmatched forecast items, and list the omissions in the data-quality report.
+- Add forecast BOM and route completeness indicators to the dashboard and runtime information sheet.
+- Add BOM hierarchy and traceability fields to ModeA and ModeB order-operation allocation details.
+- Remove the redundant BOM manufactured-item flag from report details.
+- Persist GUI paths and analysis settings between launches while resetting the optimization start date to the current day on every startup.
+- Include the v0.1.7 operator upgrade and dashboard-reading guide in the Windows release package.
+
 ## v0.1.6 - 2026-07-29
 
 - Normalize GUI path display to Windows backslashes after browsing for files or folders.

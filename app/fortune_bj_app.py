@@ -27,7 +27,7 @@ from app.machine_fingerprint import build_machine_identity_payload, sanitize_mac
 from app.version import APP_VERSION
 
 try:
-    from PySide6.QtCore import QDate, QThread, Signal, Qt, QUrl
+    from PySide6.QtCore import QDate, QSettings, QThread, Signal, Qt, QUrl
     from PySide6.QtGui import QDesktopServices, QPalette
     from PySide6.QtWidgets import (
         QApplication,
@@ -56,6 +56,7 @@ try:
     )
 except ModuleNotFoundError:  # pragma: no cover
     PYSIDE6_AVAILABLE = False
+    QSettings = object  # type: ignore[assignment]
     QThread = object  # type: ignore[assignment]
     QMainWindow = object  # type: ignore[assignment]
 
@@ -88,6 +89,8 @@ else:  # pragma: no cover
 
 
 APP_TITLE = f"Fortune BJ 产能分析工具 v{APP_VERSION}"
+SETTINGS_ORGANIZATION = "RSCP"
+SETTINGS_APPLICATION = "FortuneBJCapacityOptimizer"
 LICENSE_ACTIVE_DIR = DEPLOY_ROOT / "licenses" / "active"
 LICENSE_REQUESTS_DIR = DEPLOY_ROOT / "licenses" / "requests"
 LOG_DIR = DEPLOY_ROOT / "logs"
@@ -315,9 +318,13 @@ class CardFrame(QFrame):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, settings=None) -> None:
         super().__init__()
         ensure_license_dirs()
+        self.settings = settings if settings is not None else QSettings(
+            SETTINGS_ORGANIZATION,
+            SETTINGS_APPLICATION,
+        )
         self.setWindowTitle(APP_TITLE)
         self.resize(1380, 840)
         self.setMinimumSize(1120, 720)
@@ -327,7 +334,10 @@ class MainWindow(QMainWindow):
         self.optimization_start_month_manual = False
         self._build_ui()
         self._wire_events()
-        self._apply_theme("跟随系统")
+        self._restore_settings()
+        self.optimization_start_month_manual = False
+        self._set_optimization_start_period_to_current()
+        self._apply_theme(self.theme_combo.currentText())
         self.refresh_license_status()
         self._log("启动器已就绪。")
 
@@ -586,6 +596,95 @@ class MainWindow(QMainWindow):
         self.generate_fingerprint_btn.clicked.connect(self.generate_fingerprint)
         self.mode_b_optimization_start_month.dateChanged.connect(self._mark_optimization_start_month_manual)
         self.mode_b_optimization_granularity.currentTextChanged.connect(self._handle_optimization_granularity_changed)
+
+    @staticmethod
+    def _restore_combo_text(combo: QComboBox, value: object) -> None:
+        text = str(value or "")
+        index = combo.findText(text)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    @staticmethod
+    def _setting_bool(value: object, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _restore_settings(self) -> None:
+        settings = self.settings
+        geometry = settings.value("window/geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+
+        self._restore_combo_text(self.theme_combo, settings.value("ui/theme", "跟随系统"))
+        self._restore_combo_text(self.schedule_mode, settings.value("analysis/schedule_mode"))
+        self._restore_combo_text(
+            self.mode_b_optimization_granularity,
+            settings.value("analysis/optimization_granularity"),
+        )
+        self._restore_combo_text(self.operation_flow_mode, settings.value("analysis/operation_flow_mode"))
+        self._restore_combo_text(self.hot_surface_mode, settings.value("analysis/hot_surface_mode"))
+        self._restore_combo_text(self.objective_profile, settings.value("analysis/objective_profile"))
+
+        self.enable_forecast.setChecked(
+            self._setting_bool(settings.value("analysis/enable_forecast"), self.enable_forecast.isChecked())
+        )
+        self.enable_urgent.setChecked(
+            self._setting_bool(settings.value("analysis/enable_urgent"), self.enable_urgent.isChecked())
+        )
+        self.mode_b_max_window_tasks.setValue(
+            int(settings.value("analysis/max_window_tasks", self.mode_b_max_window_tasks.value()))
+        )
+        self.mode_b_solver_max_seconds.setValue(
+            int(settings.value("analysis/solver_max_seconds", self.mode_b_solver_max_seconds.value()))
+        )
+
+        path_controls = {
+            "paths/operations": self.ops_path,
+            "paths/demand": self.demand_path,
+            "paths/workcenter": self.wc_path,
+            "paths/optional_operations": self.optional_ops_path,
+            "paths/calendar": self.calendar_path,
+            "paths/forecast": self.forecast_path,
+            "paths/output": self.out_dir,
+        }
+        for key, edit in path_controls.items():
+            saved = settings.value(key)
+            if saved not in (None, ""):
+                edit.setText(_display_path(str(saved)))
+
+        saved_page = int(settings.value("ui/current_page", 0))
+        self.nav.setCurrentRow(max(0, min(saved_page, self.nav.count() - 1)))
+
+    def _save_settings(self) -> None:
+        self._normalize_path_fields()
+        settings = self.settings
+        settings.setValue("window/geometry", self.saveGeometry())
+        settings.setValue("ui/theme", self.theme_combo.currentText())
+        settings.setValue("ui/current_page", self.nav.currentRow())
+        settings.setValue("analysis/schedule_mode", self.schedule_mode.currentText())
+        settings.setValue("analysis/optimization_granularity", self.mode_b_optimization_granularity.currentText())
+        settings.setValue("analysis/operation_flow_mode", self.operation_flow_mode.currentText())
+        settings.setValue("analysis/max_window_tasks", self.mode_b_max_window_tasks.value())
+        settings.setValue("analysis/solver_max_seconds", self.mode_b_solver_max_seconds.value())
+        settings.setValue("analysis/hot_surface_mode", self.hot_surface_mode.currentText())
+        settings.setValue("analysis/objective_profile", self.objective_profile.currentText())
+        settings.setValue("analysis/enable_forecast", self.enable_forecast.isChecked())
+        settings.setValue("analysis/enable_urgent", self.enable_urgent.isChecked())
+        settings.setValue("paths/operations", self.ops_path.text())
+        settings.setValue("paths/demand", self.demand_path.text())
+        settings.setValue("paths/workcenter", self.wc_path.text())
+        settings.setValue("paths/optional_operations", self.optional_ops_path.text())
+        settings.setValue("paths/calendar", self.calendar_path.text())
+        settings.setValue("paths/forecast", self.forecast_path.text())
+        settings.setValue("paths/output", self.out_dir.text())
+        settings.sync()
+
+    def closeEvent(self, event) -> None:  # pragma: no cover - UI lifecycle
+        self._save_settings()
+        super().closeEvent(event)
 
     def _path_edit(self, path: Path) -> QLineEdit:
         edit = QLineEdit(_display_path(path))

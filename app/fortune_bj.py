@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import pandas as pd
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter, range_boundaries
 from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -60,6 +60,12 @@ FORECAST_ROUTE_TEMPLATE_SPECS: tuple[tuple[str, str], ...] = (
     ("沈阳", "工艺路线-沈阳.xlsx"),
     ("南通", "工艺路线-南通.xlsx"),
 )
+FORECAST_BOM_TEMPLATE_SPECS: tuple[tuple[str, str], ...] = (
+    ("北京", "北京BOM.xlsx"),
+    ("沈阳", "沈阳BOM.xlsx"),
+    ("南通", "南通BOM.xlsx"),
+)
+FORECAST_BOM_SHEET_NAME = "Data"
 
 PLACEHOLDER_DUE_YEAR = 2049
 OUTSOURCE_DURATION_HOURS = 7 * 24
@@ -106,6 +112,7 @@ class WorkCenterCapacity:
     work_center: str
     resource_group: str
     quantity: int
+    major_category: str = "未分类"
     calendar_name: str = "默认日历"
     daily_hours: float = 24.0
     capacity_calc_type: str = "普通工时"
@@ -178,6 +185,15 @@ class OperationTask:
     forecast_drawing: str = ""
     forecast_route_source: str = ""
     route_source_order: str = ""
+    bom_root_order_id: str = ""
+    bom_top_material: str = ""
+    bom_source: str = ""
+    bom_source_file: str = ""
+    bom_level: int = 0
+    bom_parent_materials: str = ""
+    bom_direct_parent_materials: str = ""
+    bom_exact_quantity: float = 0.0
+    bom_required_date: datetime | None = None
     is_outsource: bool = False
     missing_work_center: bool = False
     is_hot_surface: bool = False
@@ -525,7 +541,7 @@ def run_fortune_bj_schedule(config: FortuneBjConfig, progress: ProgressCallback 
         notify("读取需求预测...")
         forecast_demand_by_order, forecast_issues = load_forecast_demand(config)
         demand_by_order.update(forecast_demand_by_order)
-        notify(f"已生成预测虚拟订单 {len(forecast_demand_by_order)} 个，问题 {len(forecast_issues)} 条。")
+        notify(f"已生成可参与计算的预测虚拟订单 {len(forecast_demand_by_order)} 个，问题/匹配记录 {len(forecast_issues)} 条。")
     else:
         notify("需求预测导入未启用，已忽略需求预测表。")
     blocking_demand_issue_rows = _blocking_demand_issues(demand_issues)
@@ -639,7 +655,14 @@ def run_fortune_bj_schedule(config: FortuneBjConfig, progress: ProgressCallback 
     result.unmaintained_workcenter_report = _build_unmaintained_workcenter_report(scheduled_all, config=config)
     result.input_maintenance_report = _build_input_maintenance_report(config)
     notify("写入 Excel 报告...")
-    result.report_path = write_report(result, config, order_completion, license_info=license_info, progress=progress)
+    result.report_path = write_report(
+        result,
+        config,
+        order_completion,
+        license_info=license_info,
+        progress=progress,
+        capacities=capacities,
+    )
     notify(f"Excel 报告写入完成：{result.report_path}")
     return result
 
@@ -695,25 +718,26 @@ def load_workcenter_capacities(
             issues.append({"类型": "工作中心日历异常", "文件": str(path), "行号": idx + 2, "说明": f"日历名称未在工作日历中定义：{calendar_name or '(空)'}"})
             continue
         capacities[wc] = WorkCenterCapacity(
-            wc,
-            group,
-            max(int(math.floor(qty)), 1),
-            work_calendar.name,
-            work_calendar.average_daily_hours,
-            capacity_calc_type,
-            hot_surface_type,
-            _to_number(row.get("单炉容量"), default=0.0),
-            _clean_text(row.get("容量单位")) or "件",
-            _positive_or_default(_to_number(row.get("单件容量占用默认值"), default=1.0), 1.0),
-            _to_number(row.get("单炉周期小时"), default=0.0),
-            _to_number(row.get("装卸/准备小时"), default=0.0),
-            _to_bool(row.get("是否允许不足炉开炉")) if "是否允许不足炉开炉" in df.columns else True,
-            _to_number(row.get("最低开炉率"), default=0.0),
-            _to_number(row.get("流水线吞吐率"), default=0.0),
-            _clean_text(row.get("吞吐率单位")) or "件/小时",
-            _to_number(row.get("单件在炉时间小时"), default=0.0),
-            _to_number(row.get("换型时间小时"), default=0.0),
-            _clean_text(row.get("可处理工艺组")),
+            work_center=wc,
+            resource_group=group,
+            quantity=max(int(math.floor(qty)), 1),
+            major_category=_clean_text(row.get("大类")) or "未分类",
+            calendar_name=work_calendar.name,
+            daily_hours=work_calendar.average_daily_hours,
+            capacity_calc_type=capacity_calc_type,
+            hot_surface_type=hot_surface_type,
+            batch_capacity=_to_number(row.get("单炉容量"), default=0.0),
+            capacity_unit=_clean_text(row.get("容量单位")) or "件",
+            default_unit_capacity=_positive_or_default(_to_number(row.get("单件容量占用默认值"), default=1.0), 1.0),
+            batch_cycle_hours=_to_number(row.get("单炉周期小时"), default=0.0),
+            setup_hours=_to_number(row.get("装卸/准备小时"), default=0.0),
+            allow_partial_batch=_to_bool(row.get("是否允许不足炉开炉")) if "是否允许不足炉开炉" in df.columns else True,
+            min_batch_fill_rate=_to_number(row.get("最低开炉率"), default=0.0),
+            line_throughput_rate=_to_number(row.get("流水线吞吐率"), default=0.0),
+            throughput_unit=_clean_text(row.get("吞吐率单位")) or "件/小时",
+            residence_hours=_to_number(row.get("单件在炉时间小时"), default=0.0),
+            changeover_hours=_to_number(row.get("换型时间小时"), default=0.0),
+            process_groups=_clean_text(row.get("可处理工艺组")),
         )
     if missing_calendar_rows:
         preview = ", ".join(str(row) for row in missing_calendar_rows[:20])
@@ -988,8 +1012,6 @@ def load_forecast_demand(config: FortuneBjConfig) -> tuple[dict[str, dict[str, A
     if issues:
         return {}, issues
 
-    route_templates, route_issues = _load_forecast_route_templates()
-    issues.extend(route_issues)
     material_col = "物料编码"
     drawing_col = "图号" if "图号" in df.columns else ""
     month_columns: list[tuple[Any, int, int]] = []
@@ -1014,17 +1036,12 @@ def load_forecast_demand(config: FortuneBjConfig) -> tuple[dict[str, dict[str, A
         })
 
     demand: dict[str, dict[str, Any]] = {}
-    missing_route_materials: set[str] = set()
     optimization_start = _optimization_start_period(config)
     for idx, row in df.iterrows():
         material = _clean_text(row.get(material_col))
         if not material:
             continue
         drawing = _clean_text(row.get(drawing_col)) if drawing_col else ""
-        route_template = route_templates.get(material)
-        route_source_order = str(route_template.get("source_order") or "") if route_template else ""
-        forecast_route_source = str(route_template.get("route_source") or "") if route_template else ""
-        has_positive_forecast = False
         for column, year, month in month_columns:
             raw_value = row.get(column)
             if _is_blank_cell(raw_value):
@@ -1043,7 +1060,6 @@ def load_forecast_demand(config: FortuneBjConfig) -> tuple[dict[str, dict[str, A
                 continue
             if quantity_value <= 0:
                 continue
-            has_positive_forecast = True
             quantity_int = int(round(quantity_value))
             if abs(quantity_value - quantity_int) > 1e-6:
                 issues.append({
@@ -1055,8 +1071,6 @@ def load_forecast_demand(config: FortuneBjConfig) -> tuple[dict[str, dict[str, A
                     "当前值": raw_value,
                     "说明": "预测数量必须是整数件数。",
                 })
-                continue
-            if route_template is None:
                 continue
             for due_date, weekly_quantity in _split_monthly_forecast_to_sundays(year, month, quantity_int):
                 order_id = f"FCST-{due_date.strftime('%Y%m%d')}-{material}"
@@ -1083,22 +1097,32 @@ def load_forecast_demand(config: FortuneBjConfig) -> tuple[dict[str, dict[str, A
                         "预测周日": due_date.strftime("%Y-%m-%d"),
                         "预测物料": material,
                         "预测图号": drawing,
-                        "预测工艺路线来源": forecast_route_source,
-                        "路线来源订单": route_source_order,
+                        "预测源文件": str(path),
+                        "预测源文件行号": idx + 2,
+                        "预测工艺路线来源": "",
+                        "路线来源订单": "",
+                        "BOM根订单": order_id,
+                        "BOM顶层物料": material,
+                        "BOM来源": "",
+                        "BOM来源文件": "",
+                        "BOM层级": 0,
+                        "BOM父项物料": "",
+                        "BOM直接父项物料": "",
+                        "BOM精确需求数量": float(weekly_quantity),
                     }
                     continue
                 existing["数量"] = float(existing.get("数量") or 0.0) + float(weekly_quantity)
-        if route_template is None and has_positive_forecast and material not in missing_route_materials:
-            missing_route_materials.add(material)
-            issues.append({
-                "类型": "预测物料缺少工艺路线，未参与计算",
-                "文件": str(path),
-                "行号": idx + 2,
-                "物料": material,
-                "图号": drawing,
-                "说明": "该预测物料在北京、沈阳、南通工艺路线文件中均找不到匹配路线，已跳过，不参与本次产能计算。",
-            })
-    return demand, issues
+                existing["BOM精确需求数量"] = float(existing["数量"])
+    expanded_demand, bom_issues = _expand_forecast_demands_with_bom(demand)
+    issues.extend(bom_issues)
+    route_templates, route_issues = _load_forecast_route_templates()
+    issues.extend(route_issues)
+    matched_demand, route_match_issues = _match_forecast_demands_to_routes(
+        expanded_demand,
+        route_templates,
+    )
+    issues.extend(route_match_issues)
+    return matched_demand, issues
 
 
 def _blocking_forecast_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1198,6 +1222,358 @@ def _load_forecast_route_templates() -> tuple[dict[str, dict[str, Any]], list[di
             if material not in route_templates:
                 route_templates[material] = route
     return route_templates, issues
+
+
+def _load_forecast_bom_templates(
+    top_materials: set[str],
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    required_columns = (
+        "主料号",
+        "下阶物料号",
+        "阶层",
+        "子项物料",
+        "上阶物料用量",
+        "子项物料用量",
+    )
+    optional_columns = ("子物料描述", "子项物料图号")
+    unresolved = {_clean_text(material) for material in top_materials if _clean_text(material)}
+    templates: dict[str, dict[str, Any]] = {}
+    issues: list[dict[str, Any]] = []
+    for priority, (bom_source, filename) in enumerate(FORECAST_BOM_TEMPLATE_SPECS, start=1):
+        if not unresolved:
+            break
+        path = DATA_DIR / filename
+        if not path.exists():
+            issues.append({
+                "类型": "预测BOM文件缺失",
+                "文件": str(path),
+                "BOM来源": bom_source,
+                "优先级": priority,
+                "说明": "该BOM文件不存在；预测需求将继续尝试其他地区BOM文件。",
+            })
+            continue
+        try:
+            wb = load_workbook(path, read_only=True, data_only=True)
+        except Exception as exc:
+            issues.append({
+                "类型": "预测BOM文件读取失败",
+                "文件": str(path),
+                "BOM来源": bom_source,
+                "优先级": priority,
+                "说明": str(exc),
+            })
+            continue
+        try:
+            if FORECAST_BOM_SHEET_NAME not in wb.sheetnames:
+                issues.append({
+                    "类型": "预测BOM清单缺失",
+                    "文件": str(path),
+                    "BOM来源": bom_source,
+                    "优先级": priority,
+                    "说明": f"{path.name}缺少名为“{FORECAST_BOM_SHEET_NAME}”的sheet。",
+                })
+                continue
+            ws = wb[FORECAST_BOM_SHEET_NAME]
+            header_values = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+            column_index = {
+                _clean_text(value): index
+                for index, value in enumerate(header_values)
+                if _clean_text(value)
+            }
+            missing_columns = [column for column in required_columns if column not in column_index]
+            if missing_columns:
+                issues.append({
+                    "类型": "预测BOM字段缺失",
+                    "文件": str(path),
+                    "BOM来源": bom_source,
+                    "优先级": priority,
+                    "说明": "缺少字段：" + "、".join(missing_columns),
+                })
+                continue
+
+            source_rows: dict[str, list[dict[str, Any]]] = {}
+            for excel_row, values in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+                root_material = _clean_text(values[column_index["主料号"]])
+                if root_material not in unresolved:
+                    continue
+                row = {column: values[column_index[column]] for column in required_columns}
+                for column in optional_columns:
+                    if column in column_index:
+                        row[column] = values[column_index[column]]
+                row["BOM源文件行号"] = excel_row
+                source_rows.setdefault(root_material, []).append(row)
+            for root_material, bom_rows in source_rows.items():
+                if not bom_rows or root_material not in unresolved:
+                    continue
+                templates[root_material] = {
+                    "material": root_material,
+                    "bom_source": bom_source,
+                    "bom_file": str(path),
+                    "bom_priority": priority,
+                    "rows": bom_rows,
+                }
+                unresolved.remove(root_material)
+        finally:
+            wb.close()
+    return templates, issues
+
+
+def _forecast_bom_manufacturing_nodes(
+    template: dict[str, Any],
+    *,
+    top_quantity: float,
+) -> list[dict[str, Any]]:
+    root_material = _clean_text(template.get("material"))
+    rows = list(template.get("rows") or [])
+    parents_by_child: dict[str, set[str]] = {}
+    for row in rows:
+        parent = _clean_text(row.get("下阶物料号"))
+        child = _clean_text(row.get("子项物料"))
+        if parent and child:
+            parents_by_child.setdefault(child, set()).add(parent)
+
+    ancestor_cache: dict[str, set[str]] = {}
+
+    def manufacturing_ancestors(material: str, trail: set[str] | None = None) -> set[str]:
+        material = _clean_text(material)
+        if not material:
+            return {root_material} if root_material else set()
+        if material == root_material or material.upper().startswith("M"):
+            return {material}
+        if material in ancestor_cache:
+            return set(ancestor_cache[material])
+        trail = set(trail or set())
+        if material in trail:
+            return {root_material} if root_material else set()
+        trail.add(material)
+        ancestors: set[str] = set()
+        for parent in parents_by_child.get(material, set()):
+            ancestors.update(manufacturing_ancestors(parent, trail))
+        if not ancestors and root_material:
+            ancestors.add(root_material)
+        ancestor_cache[material] = set(ancestors)
+        return ancestors
+
+    nodes: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        child = _clean_text(row.get("子项物料"))
+        if not child or child == root_material or not child.upper().startswith("M"):
+            continue
+        parent = _clean_text(row.get("下阶物料号"))
+        level = max(int(_to_number(row.get("阶层"), default=0)), 1)
+        parent_usage = _to_number(row.get("上阶物料用量"), default=0.0)
+        child_usage = _to_number(row.get("子项物料用量"), default=0.0)
+        exact_quantity = max(float(top_quantity), 0.0) * max(parent_usage, 0.0) * max(child_usage, 0.0)
+        node = nodes.setdefault(child, {
+            "material": child,
+            "description": _clean_text(row.get("子物料描述")),
+            "drawing": _clean_text(row.get("子项物料图号")),
+            "level": level,
+            "exact_quantity": 0.0,
+            "parent_materials": set(),
+            "direct_parent_materials": set(),
+            "source_rows": [],
+        })
+        node["level"] = max(int(node["level"]), level)
+        node["exact_quantity"] += exact_quantity
+        node["direct_parent_materials"].add(parent)
+        node["parent_materials"].update(manufacturing_ancestors(parent))
+        node["source_rows"].append(int(_to_number(row.get("BOM源文件行号"), default=0)))
+        if not node["description"]:
+            node["description"] = _clean_text(row.get("子物料描述"))
+        if not node["drawing"]:
+            node["drawing"] = _clean_text(row.get("子项物料图号"))
+
+    return sorted(nodes.values(), key=lambda node: (-int(node["level"]), str(node["material"])))
+
+
+def _expand_forecast_demands_with_bom(
+    demand: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    top_demands = {
+        order_id: row
+        for order_id, row in demand.items()
+        if str(row.get("需求来源") or "") == "预测需求" and int(row.get("BOM层级") or 0) == 0
+    }
+    if not top_demands:
+        return demand, []
+
+    top_materials = {
+        _clean_text(row.get("预测物料")) or _forecast_material_from_order_id(order_id)
+        for order_id, row in top_demands.items()
+    }
+    bom_templates, issues = _load_forecast_bom_templates(top_materials)
+    expanded = dict(demand)
+    missing_bom_materials: set[str] = set()
+    for root_order_id, top_demand in sorted(top_demands.items()):
+        top_material = _clean_text(top_demand.get("预测物料")) or _forecast_material_from_order_id(root_order_id)
+        top_demand["BOM根订单"] = root_order_id
+        top_demand["BOM顶层物料"] = top_material
+        template = bom_templates.get(top_material)
+        if template is None:
+            top_demand["BOM来源"] = "未找到BOM"
+            if top_material not in missing_bom_materials:
+                missing_bom_materials.add(top_material)
+                issues.append({
+                    "类型": "预测顶层物料未找到BOM",
+                    "文件": str(top_demand.get("预测源文件") or ""),
+                    "行号": top_demand.get("预测源文件行号") or "",
+                    "订单": root_order_id,
+                    "物料": top_material,
+                    "说明": "该预测顶层物料在北京、沈阳、南通BOM中均未找到；继续按顶层物料自身工艺路线参与计算。",
+                })
+            continue
+
+        bom_source = str(template.get("bom_source") or "")
+        bom_file = str(template.get("bom_file") or "")
+        top_demand["BOM来源"] = bom_source
+        top_demand["BOM来源文件"] = bom_file
+        nodes = _forecast_bom_manufacturing_nodes(
+            template,
+            top_quantity=float(top_demand.get("数量") or 0.0),
+        )
+
+        for node in nodes:
+            material = str(node["material"])
+            parent_materials = sorted(str(value) for value in node["parent_materials"] if str(value).strip())
+            direct_parent_materials = sorted(str(value) for value in node["direct_parent_materials"] if str(value).strip())
+            quantity = int(math.ceil(max(float(node["exact_quantity"]) - 1e-9, 0.0)))
+            if quantity <= 0:
+                continue
+            level = int(node["level"])
+            component_order_id = f"{root_order_id}-BOM-L{level}-{material}"
+            expanded[component_order_id] = {
+                "订单": component_order_id,
+                "数量": float(quantity),
+                "交期": top_demand["交期"],
+                "紧急": bool(top_demand.get("紧急")),
+                "手动紧急": bool(top_demand.get("手动紧急")),
+                "紧急类型": str(top_demand.get("紧急类型") or ""),
+                "过期": bool(top_demand.get("过期")),
+                "原始最早交期": top_demand.get("原始最早交期") or top_demand["交期"],
+                "已转入优化开始周期": bool(top_demand.get("已转入优化开始周期")),
+                "订单优先级": int(top_demand.get("订单优先级") or PRIORITY_NORMAL),
+                "优先级类型": str(top_demand.get("优先级类型") or "普通订单"),
+                "优先级原因": str(top_demand.get("优先级原因") or "普通订单"),
+                "需求来源": "预测需求",
+                "预测月份": str(top_demand.get("预测月份") or ""),
+                "预测周日": str(top_demand.get("预测周日") or ""),
+                "预测物料": material,
+                "预测图号": str(node.get("drawing") or ""),
+                "预测源文件": str(top_demand.get("预测源文件") or ""),
+                "预测源文件行号": top_demand.get("预测源文件行号") or "",
+                "预测工艺路线来源": "",
+                "路线来源订单": "",
+                "BOM根订单": root_order_id,
+                "BOM顶层物料": top_material,
+                "BOM来源": bom_source,
+                "BOM来源文件": bom_file,
+                "BOM层级": level,
+                "BOM父项物料": "、".join(parent_materials),
+                "BOM直接父项物料": "、".join(direct_parent_materials),
+                "BOM物料描述": str(node.get("description") or ""),
+                "BOM精确需求数量": round(float(node["exact_quantity"]), 6),
+            }
+    return expanded, issues
+
+
+def _match_forecast_demands_to_routes(
+    demand: dict[str, dict[str, Any]],
+    route_templates: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    groups: dict[str, dict[str, dict[str, Any]]] = {}
+    for order_id, row in demand.items():
+        root_order_id = _clean_text(row.get("BOM根订单")) or order_id
+        material = _clean_text(row.get("预测物料")) or _forecast_material_from_order_id(order_id)
+        if material:
+            groups.setdefault(root_order_id, {})[material] = row
+
+    matched: dict[str, dict[str, Any]] = {}
+    issues: list[dict[str, Any]] = []
+    missing_top_materials: set[str] = set()
+    missing_component_keys: set[tuple[str, str]] = set()
+
+    for root_order_id, rows_by_material in sorted(groups.items()):
+        available_materials = {
+            material
+            for material in rows_by_material
+            if material in route_templates
+        }
+        ancestor_cache: dict[str, set[str]] = {}
+
+        def available_ancestors(material: str, trail: set[str] | None = None) -> set[str]:
+            material = _clean_text(material)
+            if not material:
+                return set()
+            if material in available_materials:
+                return {material}
+            if material in ancestor_cache:
+                return set(ancestor_cache[material])
+            trail = set(trail or set())
+            if material in trail:
+                return set()
+            trail.add(material)
+            parent_row = rows_by_material.get(material)
+            if parent_row is None:
+                return set()
+            resolved: set[str] = set()
+            for parent in _bom_parent_material_list(parent_row.get("BOM父项物料")):
+                resolved.update(available_ancestors(parent, trail))
+            ancestor_cache[material] = set(resolved)
+            return resolved
+
+        for material, row in sorted(rows_by_material.items()):
+            order_id = _clean_text(row.get("订单"))
+            route = route_templates.get(material)
+            bom_level = int(_to_number(row.get("BOM层级"), default=0))
+            if route is None:
+                if bom_level <= 0:
+                    if material in missing_top_materials:
+                        continue
+                    missing_top_materials.add(material)
+                    issues.append({
+                        "类型": "预测物料缺少工艺路线，未参与计算",
+                        "文件": str(row.get("预测源文件") or ""),
+                        "行号": row.get("预测源文件行号") or "",
+                        "订单": order_id,
+                        "物料": material,
+                        "图号": str(row.get("预测图号") or ""),
+                        "BOM来源": str(row.get("BOM来源") or ""),
+                        "说明": "已先完成BOM检查；该预测顶层物料在北京、沈阳、南通工艺路线中均未找到，未生成工序且不参与本次产能计算。",
+                    })
+                    continue
+                issue_key = (_clean_text(row.get("BOM顶层物料")), material)
+                if issue_key in missing_component_keys:
+                    continue
+                missing_component_keys.add(issue_key)
+                issues.append({
+                    "类型": "预测BOM制造件缺少工艺路线，未参与计算",
+                    "文件": str(row.get("预测源文件") or ""),
+                    "行号": row.get("预测源文件行号") or "",
+                    "订单": order_id,
+                    "BOM根订单": root_order_id,
+                    "BOM顶层物料": str(row.get("BOM顶层物料") or ""),
+                    "物料": material,
+                    "BOM层级": bom_level,
+                    "BOM父项物料": str(row.get("BOM父项物料") or ""),
+                    "BOM直接父项物料": str(row.get("BOM直接父项物料") or ""),
+                    "BOM来源": str(row.get("BOM来源") or ""),
+                    "BOM来源文件": str(row.get("BOM来源文件") or ""),
+                    "BOM精确需求数量": row.get("BOM精确需求数量") or "",
+                    "说明": "已完成BOM展开；该M类制造件在北京、沈阳、南通工艺路线中均未找到，未生成工序且不参与本次产能计算。",
+                })
+                continue
+
+            matched_row = dict(row)
+            matched_row["预测工艺路线来源"] = str(route.get("route_source") or "")
+            matched_row["路线来源订单"] = str(route.get("source_order") or "")
+            if bom_level > 0:
+                resolved_parents: set[str] = set()
+                for parent in _bom_parent_material_list(row.get("BOM父项物料")):
+                    resolved_parents.update(available_ancestors(parent))
+                matched_row["BOM父项物料"] = "、".join(sorted(resolved_parents))
+            matched[order_id] = matched_row
+    return matched, issues
 
 
 def _select_forecast_route_templates_by_material(
@@ -1600,6 +1976,15 @@ def _build_forecast_operation_tasks(
                 forecast_drawing=str(demand.get("预测图号") or ""),
                 forecast_route_source=str(route.get("route_source") or row.get("预测工艺路线来源") or demand.get("预测工艺路线来源") or ""),
                 route_source_order=str(route.get("source_order") or demand.get("路线来源订单") or ""),
+                bom_root_order_id=str(demand.get("BOM根订单") or order_id),
+                bom_top_material=str(demand.get("BOM顶层物料") or material),
+                bom_source=str(demand.get("BOM来源") or ""),
+                bom_source_file=str(demand.get("BOM来源文件") or ""),
+                bom_level=int(demand.get("BOM层级") or 0),
+                bom_parent_materials=str(demand.get("BOM父项物料") or ""),
+                bom_direct_parent_materials=str(demand.get("BOM直接父项物料") or ""),
+                bom_exact_quantity=float(demand.get("BOM精确需求数量") or quantity),
+                bom_required_date=demand["交期"],
                 is_outsource=is_outsource,
                 missing_work_center=missing_work_center,
                 is_hot_surface=is_hot_surface,
@@ -1684,6 +2069,9 @@ def _shift_order_items_to_optimization_start(
     for item in order_items:
         item.start += delta
         item.end += delta
+        if item.task.bom_root_order_id and item.task.bom_level > 0:
+            item.task.due_date += delta
+            item.task.bom_required_date = item.task.due_date
         item.on_time = item.end <= item.task.due_date
         item.tardy_hours = max((item.end - item.task.due_date).total_seconds() / 3600.0, 0.0)
         if item.task.is_outsource:
@@ -1803,31 +2191,172 @@ def _task_flow_duration_hours(task: OperationTask) -> float:
     return max(float(task.duration_hours or 0.0), 0.0)
 
 
+def _bom_parent_material_list(value: Any) -> list[str]:
+    return [
+        material.strip()
+        for material in re.split(r"[、,，;；|]+", str(value or ""))
+        if material.strip()
+    ]
+
+
+def _schedule_bom_task_group(
+    group_tasks: list[OperationTask],
+    *,
+    config: FortuneBjConfig | None,
+    mode_label: str,
+) -> list[ScheduledOperation]:
+    tasks_by_order: dict[str, list[OperationTask]] = {}
+    for task in group_tasks:
+        tasks_by_order.setdefault(task.order_id, []).append(task)
+    if not tasks_by_order:
+        return []
+
+    root_order_id = next(
+        (
+            task.bom_root_order_id
+            for task in group_tasks
+            if task.bom_root_order_id and task.bom_level == 0
+        ),
+        group_tasks[0].bom_root_order_id or group_tasks[0].order_id,
+    )
+    material_to_order: dict[str, str] = {}
+    for order_id, node_tasks in tasks_by_order.items():
+        material = _clean_text(node_tasks[0].material)
+        if material:
+            material_to_order[material] = order_id
+
+    parents_by_order: dict[str, set[str]] = {}
+    for order_id, node_tasks in tasks_by_order.items():
+        first_task = node_tasks[0]
+        parent_ids = {
+            material_to_order[parent_material]
+            for parent_material in _bom_parent_material_list(first_task.bom_parent_materials)
+            if parent_material in material_to_order and material_to_order[parent_material] != order_id
+        }
+        if order_id != root_order_id and not parent_ids and root_order_id in tasks_by_order:
+            parent_ids.add(root_order_id)
+        parents_by_order[order_id] = parent_ids
+
+    scheduled_by_order: dict[str, list[ScheduledOperation]] = {}
+    remaining = set(tasks_by_order)
+    while remaining:
+        ready = sorted(
+            (
+                order_id
+                for order_id in remaining
+                if parents_by_order.get(order_id, set()).issubset(scheduled_by_order)
+            ),
+            key=lambda order_id: (
+                min(task.bom_level for task in tasks_by_order[order_id]),
+                order_id,
+            ),
+        )
+        dependency_fallback = False
+        if not ready:
+            dependency_fallback = True
+            ready = [
+                min(
+                    remaining,
+                    key=lambda order_id: (
+                        min(task.bom_level for task in tasks_by_order[order_id]),
+                        order_id,
+                    ),
+                )
+            ]
+        for order_id in ready:
+            node_tasks = tasks_by_order[order_id]
+            parent_ids = parents_by_order.get(order_id, set())
+            scheduled_parent_ids = [
+                parent_id
+                for parent_id in parent_ids
+                if scheduled_by_order.get(parent_id)
+            ]
+            if scheduled_parent_ids:
+                required_date = min(
+                    min(item.start for item in scheduled_by_order[parent_id])
+                    for parent_id in scheduled_parent_ids
+                )
+            else:
+                required_date = min(task.due_date for task in node_tasks)
+            for task in node_tasks:
+                task.due_date = required_date
+                task.bom_required_date = required_date
+            node_items = _schedule_order_tasks_by_flow(node_tasks, config=config, mode_label=mode_label)
+            parent_text = "、".join(
+                sorted(
+                    {
+                        _clean_text(tasks_by_order[parent_id][0].material)
+                        for parent_id in parent_ids
+                        if parent_id in tasks_by_order
+                    }
+                )
+            )
+            for item in node_items:
+                if dependency_fallback:
+                    item.note += "；BOM依赖关系异常，已按层级顺序回退倒排"
+                elif parent_text:
+                    item.note += f"；BOM整批齐套，须在父项{parent_text}开始前完成"
+                else:
+                    item.note += "；BOM顶层预测物料"
+            scheduled_by_order[order_id] = node_items
+            remaining.remove(order_id)
+
+    scheduled = [
+        item
+        for node_items in scheduled_by_order.values()
+        for item in node_items
+    ]
+    _shift_order_items_to_optimization_start(scheduled, config=config, mode_label=mode_label)
+    return scheduled
+
+
+def _schedule_tasks_backward(
+    tasks: list[OperationTask],
+    *,
+    config: FortuneBjConfig | None,
+    mode_label: str,
+) -> list[ScheduledOperation]:
+    normal_orders: dict[str, list[OperationTask]] = {}
+    bom_groups: dict[str, list[OperationTask]] = {}
+    for task in tasks:
+        if task.bom_root_order_id:
+            bom_groups.setdefault(task.bom_root_order_id, []).append(task)
+        else:
+            normal_orders.setdefault(task.order_id, []).append(task)
+
+    scheduling_units: list[tuple[str, list[OperationTask], bool]] = [
+        (order_id, order_tasks, False)
+        for order_id, order_tasks in normal_orders.items()
+    ] + [
+        (root_order_id, group_tasks, True)
+        for root_order_id, group_tasks in bom_groups.items()
+    ]
+
+    def unit_sort_key(unit: tuple[str, list[OperationTask], bool]) -> tuple[datetime, int, datetime, datetime, str]:
+        key, unit_tasks, _is_bom = unit
+        first_period_start = min(_optimization_period_start(task, config) for task in unit_tasks)
+        priority_rank = min(task.priority_rank for task in unit_tasks)
+        priority_date = min(_priority_sort_date(task) for task in unit_tasks)
+        due_date = min(task.due_date for task in unit_tasks)
+        return first_period_start, priority_rank, priority_date, due_date, key
+
+    scheduled: list[ScheduledOperation] = []
+    for _key, unit_tasks, is_bom in sorted(scheduling_units, key=unit_sort_key):
+        if is_bom:
+            scheduled.extend(_schedule_bom_task_group(unit_tasks, config=config, mode_label=mode_label))
+            continue
+        order_items = _schedule_order_tasks_by_flow(unit_tasks, config=config, mode_label=mode_label)
+        _shift_order_items_to_optimization_start(order_items, config=config, mode_label=mode_label)
+        scheduled.extend(order_items)
+    return scheduled
+
+
 def _schedule_tasks_infinite_capacity(
     tasks: list[OperationTask],
     *,
     config: FortuneBjConfig | None = None,
 ) -> list[ScheduledOperation]:
-    tasks_by_order: dict[str, list[OperationTask]] = {}
-    for task in tasks:
-        tasks_by_order.setdefault(task.order_id, []).append(task)
-    scheduled: list[ScheduledOperation] = []
-    def order_sort_key(key: str) -> tuple[datetime, int, datetime, datetime, str]:
-        order_tasks = tasks_by_order[key]
-        first_period_start = min(_optimization_period_start(task, config) for task in order_tasks)
-        priority_rank = min(task.priority_rank for task in order_tasks)
-        priority_date = min(_priority_sort_date(task) for task in order_tasks)
-        due_date = min(task.due_date for task in order_tasks)
-        return first_period_start, priority_rank, priority_date, due_date, key
-
-    for order_id in sorted(
-        tasks_by_order,
-        key=order_sort_key,
-    ):
-        order_items = _schedule_order_tasks_by_flow(tasks_by_order[order_id], config=config, mode_label="ModeA")
-        _shift_order_items_to_optimization_start(order_items, config=config, mode_label="ModeA")
-        scheduled.extend(order_items)
-    return scheduled
+    return _schedule_tasks_backward(tasks, config=config, mode_label="ModeA")
 
 
 def _schedule_tasks_modeb_backward_with_start_shift(
@@ -1835,24 +2364,7 @@ def _schedule_tasks_modeb_backward_with_start_shift(
     *,
     config: FortuneBjConfig | None = None,
 ) -> list[ScheduledOperation]:
-    tasks_by_order: dict[str, list[OperationTask]] = {}
-    for task in tasks:
-        tasks_by_order.setdefault(task.order_id, []).append(task)
-    scheduled: list[ScheduledOperation] = []
-
-    def order_sort_key(key: str) -> tuple[datetime, int, datetime, datetime, str]:
-        order_tasks = tasks_by_order[key]
-        first_period_start = min(_optimization_period_start(task, config) for task in order_tasks)
-        priority_rank = min(task.priority_rank for task in order_tasks)
-        priority_date = min(_priority_sort_date(task) for task in order_tasks)
-        due_date = min(task.due_date for task in order_tasks)
-        return first_period_start, priority_rank, priority_date, due_date, key
-
-    for order_id in sorted(tasks_by_order, key=order_sort_key):
-        order_items = _schedule_order_tasks_by_flow(tasks_by_order[order_id], config=config, mode_label="ModeB")
-        _shift_order_items_to_optimization_start(order_items, config=config, mode_label="ModeB")
-        scheduled.extend(order_items)
-    return scheduled
+    return _schedule_tasks_backward(tasks, config=config, mode_label="ModeB")
 
 
 def _schedule_tasks_mode_b_v2(
@@ -2878,6 +3390,11 @@ def _build_modeb_optional_allocation_rows(
                 "订单": task.order_id,
                 "需求来源": task.demand_source,
                 "预测工艺路线来源": task.forecast_route_source,
+                "BOM根订单": task.bom_root_order_id,
+                "BOM顶层物料": task.bom_top_material,
+                "BOM来源": task.bom_source,
+                "BOM层级": task.bom_level,
+                "BOM父项物料": task.bom_parent_materials,
                 "物料": task.material,
                 "活动": _activity_key(task.activity),
                 "工序短文本": task.process_text,
@@ -2971,6 +3488,15 @@ def _build_modeb_order_allocation_rows(
                 "预测图号": task.forecast_drawing,
                 "预测工艺路线来源": task.forecast_route_source,
                 "路线来源订单": task.route_source_order,
+                "BOM根订单": task.bom_root_order_id,
+                "BOM顶层物料": task.bom_top_material,
+                "BOM来源": task.bom_source,
+                "BOM来源文件": task.bom_source_file,
+                "BOM层级": task.bom_level,
+                "BOM父项物料": task.bom_parent_materials,
+                "BOM直接父项物料": task.bom_direct_parent_materials,
+                "BOM精确需求数量": round(task.bom_exact_quantity, 6) if task.bom_root_order_id else "",
+                "BOM齐套需求日期": task.bom_required_date.strftime("%Y-%m-%d %H:%M") if task.bom_required_date else "",
                 "物料": task.material,
                 "活动": _activity_key(task.activity),
                 "工序短文本": task.process_text,
@@ -3413,6 +3939,7 @@ def _build_monthly_capacity_report(
             "周期日期跨度": bucket["周期日期跨度"],
             "工作中心": bucket["工作中心"],
             "资源组分类": bucket["资源组分类"],
+            "大类": capacity.major_category if capacity else "未分类",
             "日历名称": capacity.calendar_name if capacity else "",
             "设备数量": capacity.quantity if capacity else 0,
             "平均每日小时/台": round(capacity.daily_hours, 2) if capacity else 0,
@@ -3512,6 +4039,7 @@ def _build_modeb_period_capacity_report_from_allocations(
             "周期结束": _period_display_end(period_end).strftime("%Y-%m-%d"),
             "工作中心": work_center,
             "资源组分类": resource_group,
+            "大类": capacity.major_category if capacity else "未分类",
             "日历名称": capacity.calendar_name if capacity else "",
             "设备数量": equipment_quantity,
             "平均每日小时/台": round(capacity.daily_hours, 2) if capacity else 0,
@@ -3798,7 +4326,14 @@ def _build_input_maintenance_report(config: FortuneBjConfig) -> list[dict[str, A
             "字段": "Data sheet：B列物料编码、E列工作中心描述、F列工序编码、G列准备/H、H列人工/H、I列设备/H",
             "是否必填": "启用需求预测时建议维护",
             "适用逻辑": "需求预测导入",
-            "维护说明": "预测需求按北京、沈阳、南通优先级匹配工艺路线；匹配不到的预测物料不参与计算，并进入数据质量报告。",
+            "维护说明": "先完成预测BOM检查和制造件展开，再对顶层物料及M类下层制造件按北京、沈阳、南通优先级匹配工艺路线；匹配不到的制造件不参与计算，并进入数据质量报告。",
+        },
+        {
+            "输入文件": "北京BOM.xlsx / 沈阳BOM.xlsx / 南通BOM.xlsx",
+            "字段": "Data sheet：主料号、下阶物料号、阶层、子项物料、上阶物料用量、子项物料用量",
+            "是否必填": "启用需求预测且需计算下层制造件时建议维护",
+            "适用逻辑": "预测需求BOM展开",
+            "维护说明": "对全部正数预测物料先按北京、沈阳、南通优先级检查BOM，再展开M开头的下层制造件。每个顶层周度虚拟订单内先汇总精确需求量，再向上取整；下层制造件按整批齐套方式安排在父项开始前完成。",
         },
         {
             "输入文件": OPTIONAL_OPS_TEMPLATE_NAME,
@@ -3868,6 +4403,7 @@ def _build_modeb_period_capacity_report(
             "周期结束": before_bucket.get("周期结束") or after_bucket.get("周期结束") or _period_display_end(end).strftime("%Y-%m-%d"),
             "工作中心": work_center,
             "资源组分类": resource_group,
+            "大类": capacity.major_category if capacity else "未分类",
             "日历名称": capacity.calendar_name if capacity else "",
             "设备数量": quantity,
             "平均每日小时/台": round(capacity.daily_hours, 2) if capacity else 0,
@@ -4582,6 +5118,7 @@ def write_report(
     order_completion: dict[str, datetime],
     license_info: LicenseInfo | None = None,
     progress: ProgressCallback | None = None,
+    capacities: dict[str, WorkCenterCapacity] | None = None,
 ) -> Path:
     config.output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -4630,7 +5167,13 @@ def write_report(
     _emit_progress(progress, "写入报告", written_rows, total_report_rows, report_started_at, capacity_label)
     written_rows = _write_bottleneck_analysis_sheet(wb, result.bottleneck_report, config, written_rows)
     _emit_progress(progress, "写入报告", written_rows, total_report_rows, report_started_at, "瓶颈分析")
-    written_rows = _write_workcenter_heatmap_sheet(wb, result.monthly_capacity_report, config, written_rows)
+    written_rows = _write_workcenter_heatmap_sheet(
+        wb,
+        result.monthly_capacity_report,
+        config,
+        written_rows,
+        capacities=capacities or {},
+    )
     _emit_progress(progress, "写入报告", written_rows, total_report_rows, report_started_at, "工作组热力图")
     if is_mode_b:
         written_rows = _write_dict_sheet(
@@ -4767,6 +5310,45 @@ def write_report(
     return path
 
 
+def _forecast_quality_counts(result: ScheduleResult) -> dict[str, int]:
+    all_items = result.scheduled + result.outsource
+    matched_top_materials = {
+        item.task.bom_top_material or item.task.material
+        for item in all_items
+        if item.task.demand_source == "预测需求" and item.task.bom_level == 0
+    }
+    unmatched_top_route_materials = {
+        str(row.get("物料") or "")
+        for row in result.data_issues
+        if str(row.get("类型") or "") == "预测物料缺少工艺路线，未参与计算" and row.get("物料")
+    }
+    missing_bom_materials = {
+        str(row.get("物料") or "")
+        for row in result.data_issues
+        if str(row.get("类型") or "") == "预测顶层物料未找到BOM" and row.get("物料")
+    }
+    unmatched_bom_component_materials = {
+        (str(row.get("BOM顶层物料") or ""), str(row.get("物料") or ""))
+        for row in result.data_issues
+        if str(row.get("类型") or "") == "预测BOM制造件缺少工艺路线，未参与计算" and row.get("物料")
+    }
+    forecast_order_ids = {
+        item.task.order_id
+        for item in all_items
+        if item.task.demand_source == "预测需求"
+    }
+    top_materials = matched_top_materials | unmatched_top_route_materials
+    return {
+        "预测顶层物料数": len(top_materials),
+        "预测顶层物料匹配工艺路线数": len(matched_top_materials),
+        "预测顶层物料未匹配工艺路线数": len(unmatched_top_route_materials),
+        "预测顶层物料匹配BOM数": len(top_materials - missing_bom_materials),
+        "预测顶层物料未匹配BOM数": len(missing_bom_materials),
+        "预测BOM制造件未匹配工艺路线数": len(unmatched_bom_component_materials),
+        "可参与计算的预测虚拟订单数": len(forecast_order_ids),
+    }
+
+
 def _write_dashboard_sheet(
     wb: Workbook,
     result: ScheduleResult,
@@ -4788,6 +5370,7 @@ def _write_dashboard_sheet(
     remaining_shortage = sum(float(row.get("优化后缺口小时") or 0) for row in result.capacity_optimization_summary)
     unmaintained_operations = sum(int(row.get("工序数") or 0) for row in result.unmaintained_workcenter_report)
     unmaintained_load = sum(float(row.get("未维护负荷小时") or 0) for row in result.unmaintained_workcenter_report)
+    forecast_counts = _forecast_quality_counts(result)
 
     ws.append([f"执行摘要 - {mode} 产能分析"])
     modeb_start = _optimization_start_period(config)
@@ -4819,6 +5402,11 @@ def _write_dashboard_sheet(
         ("未维护工作中心负荷", round(unmaintained_load, 2), "小时"),
         (f"{_optimization_granularity(config)}度产能分析行数", len(result.monthly_capacity_report), "行"),
         ("占位交期订单数", len({str(row.get("订单") or "") for row in result.placeholder_due_orders}), "个"),
+        ("预测顶层物料数", forecast_counts["预测顶层物料数"] if config.enable_forecast else 0, "种"),
+        ("预测顶层物料未匹配BOM数", forecast_counts["预测顶层物料未匹配BOM数"] if config.enable_forecast else 0, "种"),
+        ("预测顶层物料未匹配工艺路线数", forecast_counts["预测顶层物料未匹配工艺路线数"] if config.enable_forecast else 0, "种"),
+        ("BOM下层制造件未匹配工艺路线数", forecast_counts["预测BOM制造件未匹配工艺路线数"] if config.enable_forecast else 0, "组"),
+        ("可参与计算的预测虚拟订单数", forecast_counts["可参与计算的预测虚拟订单数"] if config.enable_forecast else 0, "订单"),
         ("数据质量/调整记录数", len(result.data_issues), "条"),
     ]
     ws.append(["核心指标", "数值", "单位"])
@@ -4919,14 +5507,30 @@ def _write_bottleneck_analysis_sheet(
 def _aggregate_heatmap_rows_by_resource_group(
     rows: list[dict[str, Any]],
     config: FortuneBjConfig,
+    capacities: dict[str, WorkCenterCapacity],
 ) -> list[dict[str, Any]]:
     if not rows:
         return []
     is_period_capacity = bool("周期" in rows[0])
     is_monthly_capacity = bool("月份" in rows[0])
-    is_modeb_capacity = bool((is_period_capacity or is_monthly_capacity) and "优化后负荷率" in rows[0])
-    is_infinite_capacity = bool("无限产能负荷率" in rows[0])
+    is_modeb_capacity = any("优化后负荷小时" in row for row in rows)
+    is_infinite_capacity = any("无限产能负荷小时" in row for row in rows)
     period_key = "周期" if is_period_capacity else ("月份" if is_monthly_capacity else "期间")
+
+    profiles: dict[str, dict[str, Any]] = {}
+    for capacity in capacities.values():
+        resource_group = _clean_text(capacity.resource_group) or "未分组"
+        profile = profiles.setdefault(resource_group, {
+            "工作组": resource_group,
+            "大类集合": set(),
+            "设备数量": 0,
+            "工作中心产能": [],
+            "顺序": len(profiles),
+        })
+        profile["大类集合"].add(_clean_text(capacity.major_category) or "未分类")
+        profile["设备数量"] = max(int(profile["设备数量"]), int(capacity.quantity))
+        profile["工作中心产能"].append(capacity)
+
     buckets: dict[tuple[str, str], dict[str, Any]] = {}
 
     for row in rows:
@@ -4937,62 +5541,70 @@ def _aggregate_heatmap_rows_by_resource_group(
         bucket = buckets.setdefault((resource_group, period), {
             period_key: period,
             "工作组": resource_group,
-            "周期产能小时": 0.0,
-            "优化前负荷小时": 0.0,
-            "优化后负荷小时": 0.0,
-            "无限产能负荷小时": 0.0,
-            "负荷小时": 0.0,
-            "产能小时": 0.0,
+            "大类": _clean_text(row.get("大类")) or "未分类",
+            "设备数量": 0,
+            "回退产能小时": 0.0,
+            "需求工时": 0.0,
         })
         capacity_hours = _to_number(row.get("周期产能小时"), default=_to_number(row.get("产能小时"), default=0.0))
-        bucket["周期产能小时"] += capacity_hours
-        bucket["产能小时"] += capacity_hours
+        bucket["回退产能小时"] = max(float(bucket["回退产能小时"]), capacity_hours)
+        bucket["设备数量"] = max(int(bucket["设备数量"]), int(_to_number(row.get("设备数量"), default=0)))
         if is_modeb_capacity:
-            bucket["优化前负荷小时"] += _to_number(
-                row.get("优化前负荷小时"),
-                default=_to_number(row.get("原始负荷小时"), default=0.0),
-            )
-            bucket["优化后负荷小时"] += _to_number(row.get("优化后负荷小时"), default=0.0)
+            bucket["需求工时"] += _to_number(row.get("优化后负荷小时"), default=0.0)
         elif is_infinite_capacity:
-            bucket["无限产能负荷小时"] += _to_number(row.get("无限产能负荷小时"), default=0.0)
+            bucket["需求工时"] += _to_number(row.get("无限产能负荷小时"), default=0.0)
         else:
-            bucket["负荷小时"] += _to_number(row.get("负荷小时"), default=0.0)
+            bucket["需求工时"] += _to_number(row.get("负荷小时"), default=0.0)
 
+        if resource_group not in profiles:
+            profiles[resource_group] = {
+                "工作组": resource_group,
+                "大类集合": {_clean_text(row.get("大类")) or "未分类"},
+                "设备数量": int(_to_number(row.get("设备数量"), default=0)),
+                "工作中心产能": [],
+                "顺序": len(profiles),
+            }
+
+    periods = sorted({period for (_group, period) in buckets})
     grouped_rows: list[dict[str, Any]] = []
-    for (_resource_group, _period), bucket in sorted(buckets.items(), key=lambda item: (item[0][0], item[0][1])):
-        capacity_hours = float(bucket["周期产能小时"])
-        if is_modeb_capacity:
-            before_load = float(bucket["优化前负荷小时"])
-            after_load = float(bucket["优化后负荷小时"])
+    for resource_group, profile in sorted(profiles.items(), key=lambda item: int(item[1]["顺序"])):
+        categories = sorted(str(value) for value in profile["大类集合"] if str(value).strip())
+        major_category = categories[0] if len(categories) == 1 else ("大类冲突" if categories else "未分类")
+        profile_capacities = list(profile["工作中心产能"])
+        equipment_quantity = int(profile["设备数量"])
+        for period in periods:
+            bucket = buckets.get((resource_group, period), {})
+            demand_hours = float(bucket.get("需求工时", 0.0))
+            if profile_capacities:
+                capacity_hours = max(
+                    (_period_capacity_hours(period, capacity, config=config) for capacity in profile_capacities),
+                    default=0.0,
+                )
+            else:
+                capacity_hours = float(bucket.get("回退产能小时", 0.0))
+                equipment_quantity = max(equipment_quantity, int(bucket.get("设备数量", 0)))
+
+            if capacity_hours > 0:
+                load_ratio: float | str = round(demand_hours / capacity_hours, 4)
+            else:
+                load_ratio = "无法计算" if demand_hours > 0 else 0.0
+
+            if equipment_quantity > 0 and capacity_hours > 0:
+                single_equipment_hours = capacity_hours / equipment_quantity
+                required_equipment: int | str = math.ceil(max(demand_hours / single_equipment_hours - 1e-9, 0.0))
+            else:
+                required_equipment = "产能未维护"
+
             grouped_rows.append({
-                period_key: bucket[period_key],
-                "工作组": bucket["工作组"],
-                "周期产能小时": round(capacity_hours, 2),
-                "优化前负荷小时": round(before_load, 2),
-                "优化前负荷率": round(before_load / capacity_hours, 4) if capacity_hours > 0 else 0,
-                "优化前缺口小时": round(max(before_load - capacity_hours, 0.0), 2),
-                "优化后负荷小时": round(after_load, 2),
-                "优化后负荷率": round(after_load / capacity_hours, 4) if capacity_hours > 0 else 0,
-                "优化后缺口小时": round(max(after_load - capacity_hours, 0.0), 2),
-            })
-        elif is_infinite_capacity:
-            infinite_load = float(bucket["无限产能负荷小时"])
-            grouped_rows.append({
-                period_key: bucket[period_key],
-                "工作组": bucket["工作组"],
-                "周期产能小时": round(capacity_hours, 2),
-                "无限产能负荷小时": round(infinite_load, 2),
-                "无限产能负荷率": round(infinite_load / capacity_hours, 4) if capacity_hours > 0 else 0,
-                "产能缺口小时(无限口径)": round(max(infinite_load - capacity_hours, 0.0), 2),
-            })
-        else:
-            load_hours = float(bucket["负荷小时"])
-            grouped_rows.append({
-                period_key: bucket[period_key],
-                "工作组": bucket["工作组"],
-                "产能小时": round(capacity_hours, 2),
-                "负荷小时": round(load_hours, 2),
-                "负荷率": round(load_hours / capacity_hours, 4) if capacity_hours > 0 else 0,
+                period_key: period,
+                "大类": major_category,
+                "工作组": resource_group,
+                "工作组顺序": int(profile["顺序"]),
+                "设备数量": equipment_quantity,
+                "需求工时": round(demand_hours, 2),
+                "理论工时": round(capacity_hours, 2),
+                "负荷": load_ratio,
+                "设备需求数量": required_equipment,
             })
     return grouped_rows
 
@@ -5002,55 +5614,94 @@ def _write_workcenter_heatmap_sheet(
     rows: list[dict[str, Any]],
     config: FortuneBjConfig,
     written_rows: int,
+    *,
+    capacities: dict[str, WorkCenterCapacity],
 ) -> int:
-    rows = _aggregate_heatmap_rows_by_resource_group(rows, config)
+    rows = _aggregate_heatmap_rows_by_resource_group(rows, config, capacities)
     is_period_capacity = bool(rows and "周期" in rows[0])
     is_monthly_capacity = bool(rows and "月份" in rows[0])
-    is_modeb_capacity = bool((is_period_capacity or is_monthly_capacity) and "优化后负荷率" in rows[0])
-    is_infinite_capacity = bool(rows and "无限产能负荷率" in rows[0])
     period_granularity = _optimization_granularity(config)
     period_key = "周期" if is_period_capacity else ("月份" if is_monthly_capacity else "期间")
     periods = sorted({str(row.get(period_key) or "") for row in rows if row.get(period_key)})
-    workgroups = sorted({str(row.get("工作组") or "") for row in rows if row.get("工作组")})
+    workgroup_profiles: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        group = str(row.get("工作组") or "").strip()
+        if not group:
+            continue
+        workgroup_profiles.setdefault(group, {
+            "大类": str(row.get("大类") or "未分类"),
+            "设备数量": row.get("设备数量", 0),
+            "顺序": int(row.get("工作组顺序", 0)),
+        })
     lookup = {(str(row.get("工作组") or ""), str(row.get(period_key) or "")): row for row in rows}
-    headers = ["工作组", "指标", *[_period_display_label(period, config) for period in periods]]
-    table_rows: list[list[Any]] = []
-    for group in workgroups:
-        if is_modeb_capacity:
-            table_rows.append([group, "优化后负荷率", *[lookup.get((group, period), {}).get("优化后负荷率", "") for period in periods]])
-            table_rows.append([group, "优化后负荷小时", *[lookup.get((group, period), {}).get("优化后负荷小时", "") for period in periods]])
-            table_rows.append([group, "优化后缺口小时", *[lookup.get((group, period), {}).get("优化后缺口小时", "") for period in periods]])
-            table_rows.append([group, "周期产能小时", *[lookup.get((group, period), {}).get("周期产能小时", "") for period in periods]])
-        elif is_infinite_capacity:
-            table_rows.append([group, "无限产能负荷率", *[lookup.get((group, period), {}).get("无限产能负荷率", "") for period in periods]])
-            table_rows.append([group, "无限产能负荷小时", *[lookup.get((group, period), {}).get("无限产能负荷小时", "") for period in periods]])
-            table_rows.append([group, "周期产能小时", *[lookup.get((group, period), {}).get("周期产能小时", "") for period in periods]])
-        else:
-            table_rows.append([group, "负荷率", *[lookup.get((group, period), {}).get("负荷率", "") for period in periods]])
-            table_rows.append([group, "负荷小时", *[lookup.get((group, period), {}).get("负荷小时", "") for period in periods]])
-            table_rows.append([group, "产能小时", *[lookup.get((group, period), {}).get("产能小时", "") for period in periods]])
-    if not table_rows:
-        headers = ["工作组", "指标", "无数据"]
-        table_rows = [["无", "优化后负荷率" if is_modeb_capacity else ("无限产能负荷率" if is_infinite_capacity else "负荷率"), ""]]
     ws = wb.create_sheet("工作组热力图")
-    last_col = max(len(headers), 3)
-    last_letter = get_column_letter(last_col)
-    if is_modeb_capacity:
-        ws.append([f"ModeB产能优化工作组热力图 - {_normalize_mode(config.schedule_mode)} | 按资源组分类汇总优化后负荷率、负荷小时、缺口小时"])
-        ws.append(["周期汇总：热力图按工作组展示；周度/月度产能分析仍保留工作中心明细。"])
-    elif is_infinite_capacity:
-        ws.append([f"ModeA工作组热力图 - {_normalize_mode(config.schedule_mode)} | 按资源组分类汇总无限产能负荷率、负荷小时、产能小时"])
-        ws.append([f"{period_granularity}度汇总：用于识别工作组压力；周度/月度产能分析仍保留工作中心明细。"])
-    else:
-        ws.append([f"工作组热力图 - {_normalize_mode(config.schedule_mode)} | 按资源组分类汇总负荷率、负荷小时、产能小时"])
-        ws.append([f"{period_granularity}度汇总：用于识别工作组产能压力。"])
-    ws.append(headers)
-    for row in table_rows:
-        ws.append(row)
+    if not periods or not workgroup_profiles:
+        ws.append([f"{_normalize_mode(config.schedule_mode)}设备资源组产能热力图"])
+        ws.append(["状态", "无可展示的周期产能数据"])
+        _format_table(ws, header_row=2)
+        return written_rows + 1
+
+    period_labels = [_period_display_label(period, config) for period in periods]
+    period_count = len(periods)
+    last_col = 2 + period_count * 4
+    mode = _normalize_mode(config.schedule_mode)
+    demand_basis = "优化后厂内负荷小时" if mode == "ModeB" else "无限产能负荷小时"
+    ws.append([f"{mode}设备资源组产能热力图 - 按大类与资源组展示"])
+    ws.append([
+        f"{period_granularity}度口径：需求工时采用{demand_basis}；理论工时来自工作日历；设备需求数量按满足需求所需设备总台数向上取整。"
+    ])
+    ws.append(["设备资源组"])
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=last_col)
-    _format_workcenter_heatmap(ws, header_row=3)
-    return written_rows + len(table_rows)
+    ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=2)
+
+    metric_keys = ("需求工时", "理论工时", "负荷", "设备需求数量")
+    for metric_index, metric in enumerate(metric_keys):
+        start_col = 3 + metric_index * period_count
+        end_col = start_col + period_count - 1
+        ws.cell(3, start_col, metric)
+        if end_col > start_col:
+            ws.merge_cells(start_row=3, start_column=start_col, end_row=3, end_column=end_col)
+
+    category_order = {"机加": 0, "表处": 1, "热处": 2, "未分类": 98, "大类冲突": 99}
+    categories = sorted(
+        {str(profile["大类"] or "未分类") for profile in workgroup_profiles.values()},
+        key=lambda value: (category_order.get(value, 50), value),
+    )
+    section_rows: list[int] = []
+    subheader_rows: list[int] = []
+    data_rows: list[int] = []
+    for category in categories:
+        section_row = ws.max_row + 1
+        ws.append([category])
+        ws.merge_cells(start_row=section_row, start_column=1, end_row=section_row, end_column=last_col)
+        section_rows.append(section_row)
+
+        subheader_row = ws.max_row + 1
+        ws.append(["资源组", "设备台数", *period_labels, *period_labels, *period_labels, *period_labels])
+        subheader_rows.append(subheader_row)
+
+        groups = sorted(
+            (group for group, profile in workgroup_profiles.items() if str(profile["大类"] or "未分类") == category),
+            key=lambda group: (int(workgroup_profiles[group]["顺序"]), group),
+        )
+        for group in groups:
+            profile = workgroup_profiles[group]
+            output_row: list[Any] = [group, profile["设备数量"]]
+            for metric in metric_keys:
+                output_row.extend(lookup.get((group, period), {}).get(metric, "") for period in periods)
+            ws.append(output_row)
+            data_rows.append(ws.max_row)
+
+    _format_workcenter_heatmap(
+        ws,
+        top_header_row=3,
+        section_rows=section_rows,
+        subheader_rows=subheader_rows,
+        data_rows=data_rows,
+        period_count=period_count,
+    )
+    return written_rows + len(data_rows)
 
 
 def _write_product_risk_sheet(
@@ -5143,11 +5794,8 @@ def _write_summary_sheet(
     modeb_start = _optimization_start_period(config)
     modeb_start_period = _period_label_from_start(modeb_start, config) if modeb_start else ""
     forecast_route_files = "；".join(filename for _source, filename in FORECAST_ROUTE_TEMPLATE_SPECS)
-    unmatched_forecast_materials = {
-        str(row.get("物料") or "")
-        for row in result.data_issues
-        if str(row.get("类型") or "") == "预测物料缺少工艺路线，未参与计算" and row.get("物料")
-    }
+    forecast_bom_files = "；".join(filename for _source, filename in FORECAST_BOM_TEMPLATE_SPECS)
+    forecast_counts = _forecast_quality_counts(result)
     rows = [
         ("运行时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         ("工具版本", APP_VERSION),
@@ -5161,7 +5809,16 @@ def _write_summary_sheet(
         ("需求预测表", str(config.forecast_path) if config.enable_forecast and config.forecast_path else ""),
         ("预测工艺路线优先级", "北京 > 沈阳 > 南通" if config.enable_forecast else ""),
         ("预测工艺路线文件", forecast_route_files if config.enable_forecast else ""),
-        ("预测物料未匹配数", len(unmatched_forecast_materials) if config.enable_forecast else ""),
+        ("预测顶层物料数", forecast_counts["预测顶层物料数"] if config.enable_forecast else ""),
+        ("预测顶层物料匹配工艺路线数", forecast_counts["预测顶层物料匹配工艺路线数"] if config.enable_forecast else ""),
+        ("预测顶层物料未匹配工艺路线数", forecast_counts["预测顶层物料未匹配工艺路线数"] if config.enable_forecast else ""),
+        ("预测BOM优先级", "北京 > 沈阳 > 南通" if config.enable_forecast else ""),
+        ("预测BOM文件", forecast_bom_files if config.enable_forecast else ""),
+        ("预测BOM制造件流转", "整批齐套；下层制造件在父项开始前完成" if config.enable_forecast else ""),
+        ("预测顶层物料匹配BOM数", forecast_counts["预测顶层物料匹配BOM数"] if config.enable_forecast else ""),
+        ("预测顶层物料未匹配BOM数", forecast_counts["预测顶层物料未匹配BOM数"] if config.enable_forecast else ""),
+        ("预测BOM制造件未匹配工艺路线数", forecast_counts["预测BOM制造件未匹配工艺路线数"] if config.enable_forecast else ""),
+        ("可参与计算的预测虚拟订单数", forecast_counts["可参与计算的预测虚拟订单数"] if config.enable_forecast else ""),
         ("工序流转逻辑", _operation_flow_mode(config)),
         ("优化粒度", _optimization_granularity(config)),
         ("优化开始日期", modeb_start.strftime("%Y-%m-%d") if modeb_start else ""),
@@ -5224,6 +5881,7 @@ def _write_schedule_sheet(
     ws = wb.create_sheet(title)
     headers = [
         "订单", "需求来源", "预测月份", "预测周日", "预测图号", "预测工艺路线来源", "路线来源订单", "活动", "物料", "工序短文本", "工作中心", "资源组分类", "订单数量",
+        "BOM根订单", "BOM顶层物料", "BOM来源", "BOM来源文件", "BOM层级", "BOM父项物料", "BOM直接父项物料", "BOM精确需求数量", "BOM齐套需求日期",
         "单位工时(小时/pcs)", "工序生产时间(小时)", "本周期负荷小时", "开始时间", "完成时间", "需求日期",
         "原始供给日期", "调整后供给日期", "紧急类型", "是否紧急", "订单优先级", "优先级类型", "优先级原因",
         "是否手动紧急", "是否过期转入优化开始日期", "是否热处/表处", "是否外协", "是否未维护工作中心",
@@ -5253,6 +5911,15 @@ def _write_schedule_sheet(
                 item.task.work_center,
                 item.task.resource_group,
                 item.task.quantity,
+                item.task.bom_root_order_id,
+                item.task.bom_top_material,
+                item.task.bom_source,
+                item.task.bom_source_file,
+                item.task.bom_level if item.task.bom_root_order_id else "",
+                item.task.bom_parent_materials,
+                item.task.bom_direct_parent_materials,
+                round(item.task.bom_exact_quantity, 6) if item.task.bom_root_order_id else "",
+                item.task.bom_required_date.strftime("%Y-%m-%d %H:%M") if item.task.bom_required_date else "",
                 item.task.unit_hours,
                 total_load_hours,
                 period_load_hours,
@@ -5536,11 +6203,21 @@ def _format_table(ws, header_row: int = 1) -> None:
     ws.freeze_panes = f"A{header_row + 1}"
 
 
-def _format_workcenter_heatmap(ws, header_row: int = 3) -> None:
+def _format_workcenter_heatmap(
+    ws,
+    *,
+    top_header_row: int,
+    section_rows: list[int],
+    subheader_rows: list[int],
+    data_rows: list[int],
+    period_count: int,
+) -> None:
     title_fill = PatternFill("solid", fgColor="D9EAF7")
-    section_fill = PatternFill("solid", fgColor="1F4E79")
-    header_font = Font(color="FFFFFF", bold=True)
-    thin = Side(style="thin", color="D9D9D9")
+    main_header_fill = PatternFill("solid", fgColor="FFFFFF")
+    section_fill = PatternFill("solid", fgColor="D9D9D9")
+    subheader_fill = PatternFill("solid", fgColor="F2F2F2")
+    overload_fill = PatternFill("solid", fgColor="F4CCCC")
+    thin = Side(style="thin", color="7F7F7F")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     for cell in ws[1]:
@@ -5548,41 +6225,80 @@ def _format_workcenter_heatmap(ws, header_row: int = 3) -> None:
         cell.font = Font(bold=True, color="1F4E79", size=14)
         cell.alignment = Alignment(horizontal="left", vertical="center")
     for cell in ws[2]:
-        cell.fill = section_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="left", vertical="center")
-    for cell in ws[header_row]:
-        cell.fill = section_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
+        cell.fill = title_fill
+        cell.font = Font(color="404040", size=10)
+        cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    for cell in ws[top_header_row]:
+        cell.fill = main_header_fill
+        cell.font = Font(color="000000", bold=True, size=13)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for row_idx in section_rows:
+        for cell in ws[row_idx]:
+            cell.fill = section_fill
+            cell.font = Font(color="000000", bold=True, size=13)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[row_idx].height = 25
+
+    for row_idx in subheader_rows:
+        for cell in ws[row_idx]:
+            cell.fill = subheader_fill
+            cell.font = Font(color="000000", bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.row_dimensions[row_idx].height = 42
 
     for row in ws.iter_rows():
         for cell in row:
             cell.border = border
-            cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        metric = str(ws.cell(row_idx, 2).value or "")
+    demand_start = 3
+    theory_start = demand_start + period_count
+    load_start = theory_start + period_count
+    equipment_start = load_start + period_count
+    for row_idx in data_rows:
         ws.cell(row_idx, 1).alignment = Alignment(horizontal="left", vertical="center")
-        ws.cell(row_idx, 2).alignment = Alignment(horizontal="center", vertical="center")
-        for col_idx in range(3, ws.max_column + 1):
+        ws.cell(row_idx, 2).number_format = "#,##0"
+        for col_idx in range(2, ws.max_column + 1):
+            ws.cell(row_idx, col_idx).alignment = Alignment(horizontal="center", vertical="center")
+        has_overload = False
+        for col_idx in range(demand_start, theory_start):
             cell = ws.cell(row_idx, col_idx)
             if isinstance(cell.value, (int, float)):
-                if "负荷率" in metric:
-                    cell.number_format = "0.0%"
-                    cell.fill = _capacity_heatmap_fill(cell.value)
-                    cell.font = Font(
-                        color=_heatmap_font_color(cell.value),
-                        bold=_heatmap_font_bold(cell.value),
-                    )
-                else:
-                    cell.number_format = "#,##0.0"
-            elif "负荷率" in metric and cell.value in (None, ""):
-                cell.fill = PatternFill()
-    ws.row_dimensions[1].height = 24
-    ws.row_dimensions[2].height = 22
-    ws.row_dimensions[header_row].height = max(ws.row_dimensions[header_row].height or 0, 24)
-    ws.freeze_panes = None
+                cell.number_format = "#,##0.0"
+        for col_idx in range(theory_start, load_start):
+            cell = ws.cell(row_idx, col_idx)
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = "#,##0.0"
+        for col_idx in range(load_start, equipment_start):
+            cell = ws.cell(row_idx, col_idx)
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = "0.0%"
+                cell.fill = _capacity_heatmap_fill(cell.value)
+                cell.font = Font(
+                    color=_heatmap_font_color(cell.value),
+                    bold=_heatmap_font_bold(cell.value),
+                )
+                has_overload = has_overload or float(cell.value) > 1.0
+            elif cell.value == "无法计算":
+                cell.fill = overload_fill
+                cell.font = Font(color="9C0006", bold=True)
+        for col_idx in range(equipment_start, equipment_start + period_count):
+            cell = ws.cell(row_idx, col_idx)
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = "#,##0"
+        if has_overload:
+            ws.cell(row_idx, 1).fill = overload_fill
+            ws.cell(row_idx, 1).font = Font(color="9C0006", bold=True)
+
+    ws.row_dimensions[1].height = 26
+    ws.row_dimensions[2].height = 30
+    ws.row_dimensions[top_header_row].height = 32
+    first_data_row = data_rows[0] if data_rows else top_header_row + 1
+    ws.freeze_panes = f"C{first_data_row}"
+    ws.sheet_view.showGridLines = False
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
 
 
 def _capacity_heatmap_fill(value: Any) -> PatternFill:
@@ -5733,6 +6449,12 @@ def _recommended_column_width(ws, column_cells, header_row: int) -> float:
 
 def _autosize_workbook(wb: Workbook) -> None:
     for ws in wb.worksheets:
+        if ws.title == "工作组热力图":
+            ws.column_dimensions["A"].width = 24
+            ws.column_dimensions["B"].width = 12
+            for column_index in range(3, ws.max_column + 1):
+                ws.column_dimensions[get_column_letter(column_index)].width = 19
+            continue
         header_row = _infer_autosize_header_row(ws)
         for column_cells in ws.columns:
             letter = get_column_letter(column_cells[0].column)
